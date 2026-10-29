@@ -5,7 +5,10 @@ import { createLspClient, type LspClient, type DiagnosticResult } from "./client
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import type { Diagnostic } from "vscode-languageserver-protocol";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { type Dirent } from "node:fs";
+import { join } from "node:path";
+import { logLine } from "./log.js";
 
 interface ManagedServer {
   config: LanguageServerConfig;
@@ -118,28 +121,75 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (servers.size === 0) stopSweepTimer();
   }
 
-  async function spawnServer(config: LanguageServerConfig, root: string, serverKey: string): Promise<ManagedServer | null> {
+  // Local patch (persisted via ~/.pi mount): auto-detect compile_commands.json
+  // under the workspace root and pass it to clangd, since clangd only looks
+  // in parent directories of source files.
+  async function findCompileCommandsDir(root: string, maxDepth = 4): Promise<string | undefined> {
+    const found: { dir: string; mtime: number }[] = [];
+    async function walk(dir: string, depth: number): Promise<void> {
+      let entries: Dirent[];
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      if (entries.some((e) => e.isFile() && e.name === "compile_commands.json")) {
+        try {
+          const st = await stat(join(dir, "compile_commands.json"));
+          found.push({ dir, mtime: st.mtimeMs });
+        } catch {
+          // ignore
+        }
+      }
+      if (depth >= maxDepth) return;
+      for (const e of entries) {
+        if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules") {
+          await walk(join(dir, e.name), depth + 1);
+        }
+      }
+    }
+    await walk(root, 0);
+    found.sort((a, b) => b.mtime - a.mtime);
+    return found[0]?.dir;
+  }
+
+  async function spawnServer(config: LanguageServerConfig, root: string, serverKey: string, cwd?: string): Promise<ManagedServer | null> {
     if (disabledBinaries.has(config.id)) return null;
     if (failedRoots.has(serverKey)) return null;
 
     const binaryPath = await which(config.command);
     if (!binaryPath) {
-      console.error(`[pi-lsp-lite:${config.id}] ${config.command} not found on PATH, disabling ${config.id}`);
+      logLine(`[pi-lsp-lite:${config.id}] ${config.command} not found on PATH, disabling ${config.id}`);
       disabledBinaries.add(config.id);
       return null;
     }
 
-    const child = spawn(binaryPath, config.args, {
+    let args = config.args;
+    if (config.command === "clangd") {
+      // findWorkspaceRoot stops at the *nearest* root pattern (e.g. a per-app
+      // CMakeLists.txt), so `root` can be a subdir of the workspace while the
+      // build tree with compile_commands.json sits at the outer workspace
+      // root. Search from cwd first (it contains root), then fall back to root.
+      let dbDir = await findCompileCommandsDir(cwd ?? root);
+      if (!dbDir && cwd && cwd !== root) {
+        dbDir = await findCompileCommandsDir(root);
+      }
+      if (dbDir) {
+        logLine(`[pi-lsp-lite:cpp:${root}] using compile_commands.json from ${dbDir}`);
+        args = [...args, `--compile-commands-dir=${dbDir}`];
+      }
+    }
+    const child = spawn(binaryPath, args, {
       cwd: root,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      console.error(`[pi-lsp-lite:${config.id}:${root}]`, chunk.toString().trimEnd());
+      logLine(`[pi-lsp-lite:${config.id}:${root}]`, chunk.toString().trimEnd());
     });
 
     child.on("error", (err) => {
-      console.error(`[pi-lsp-lite:${config.id}:${root}] process error:`, err);
+      logLine(`[pi-lsp-lite:${config.id}:${root}] process error:`, err);
     });
 
     const client = createLspClient(child);
@@ -154,7 +204,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       clearTimeout(initTimer!);
     } catch (err) {
       clearTimeout(initTimer!);
-      console.error(`[pi-lsp-lite:${config.id}:${root}] failed to initialize:`, err);
+      logLine(`[pi-lsp-lite:${config.id}:${root}] failed to initialize:`, err);
       await killProcess(child);
       client.shutdown().catch(() => {});
       failedRoots.add(serverKey);
@@ -189,7 +239,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return server;
   }
 
-  async function ensureServer(config: LanguageServerConfig, root: string): Promise<ManagedServer | null> {
+  async function ensureServer(config: LanguageServerConfig, root: string, cwd?: string): Promise<ManagedServer | null> {
     const serverKey = `${config.id}:${root}`;
     const existing = servers.get(serverKey);
     if (existing) return existing;
@@ -200,7 +250,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     const inflight = pending.get(serverKey);
     if (inflight) return inflight;
 
-    const promise = spawnServer(config, root, serverKey).finally(() => pending.delete(serverKey));
+    const promise = spawnServer(config, root, serverKey, cwd).finally(() => pending.delete(serverKey));
     pending.set(serverKey, promise);
     return promise;
   }
@@ -251,7 +301,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   return {
     async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
-      const server = await ensureServer(config, root);
+      const server = await ensureServer(config, root, cwd);
       if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };
 
       // serialize edits per server to avoid concurrent waitForDiagnostics races

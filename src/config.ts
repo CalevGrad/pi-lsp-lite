@@ -3,6 +3,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type LanguageServerConfig, builtinLanguages } from "./languages.js";
+import { logLine } from "./log.js";
 
 export interface ServerConfigOverride {
   extensions?: string[];
@@ -14,10 +15,23 @@ export interface ServerConfigOverride {
   disabled?: boolean;
 }
 
+/**
+ * Каналы вывода диагностик после правки — работают одновременно.
+ * - "status" — одна строка в футере (ctx.ui.setStatus), у строки ввода;
+ * - "widget" — панель над строкой ввода (ctx.ui.setWidget), pi обрезает на 10 строках;
+ * - "chat"   — блок `⚠ LSP diagnostics for …` в transcript (ctx.ui.notify).
+ * Встроенный рендер edit/write показывает только свой diff, поэтому подробности
+ * из tool_result в блоке инструмента не видны — для них и нужны каналы выше.
+ */
+export type UiChannel = "status" | "widget" | "chat";
+/** "silent" — ни один канал; эквивалентно пустому списку. */
+export type UiMode = UiChannel | UiChannel[] | "silent";
+
 export interface UserConfig {
   servers?: Record<string, ServerConfigOverride>;
   diagnosticTimeout?: number;
   documentIdleTimeout?: number;
+  ui?: UiMode;
 }
 
 export interface ResolvedConfig {
@@ -25,11 +39,15 @@ export interface ResolvedConfig {
   diagnosticTimeout: number;
   documentIdleTimeout: number;
   perServerTimeout: Map<string, number>;
+  ui: UiChannel[];
 }
 
 export const DEFAULT_DIAGNOSTIC_TIMEOUT = 5_000;
 export const DEFAULT_DOCUMENT_IDLE_TIMEOUT = 120_000;
 export const DEFAULT_MAX_RETRIES = 3;
+export const DEFAULT_UI_MODE: UiChannel[] = ["chat", "status"];
+
+const UI_CHANNELS: UiChannel[] = ["status", "widget", "chat"];
 
 const MIN_DIAGNOSTIC_TIMEOUT = 1_000;
 const MAX_DIAGNOSTIC_TIMEOUT = 60_000;
@@ -51,6 +69,27 @@ function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((item) => typeof item === "string");
 }
 
+function normalizeUiMode(raw: unknown): UiChannel[] | undefined {
+  const items = Array.isArray(raw) ? raw : [raw];
+  const channels: UiChannel[] = [];
+  let accepted = false;
+
+  for (const item of items) {
+    if (item === "silent") {
+      accepted = true;
+      continue;
+    }
+    if (typeof item === "string" && (UI_CHANNELS as string[]).includes(item)) {
+      if (!channels.includes(item as UiChannel)) channels.push(item as UiChannel);
+      accepted = true;
+      continue;
+    }
+    logLine(`[pi-lsp-lite] config "ui": unknown channel ${JSON.stringify(item)}, expected ${UI_CHANNELS.join(" | ")} or "silent" — ignored`);
+  }
+
+  return accepted ? channels : undefined;
+}
+
 function validateOverride(id: string, raw: unknown): ServerConfigOverride | null {
   if (!isPlainObject(raw)) return null;
 
@@ -63,7 +102,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.extensions !== undefined) {
     if (!isStringArray(raw.extensions) || raw.extensions.length === 0) {
-      console.error(`[pi-lsp-lite] config "${id}": extensions must be a non-empty string array, skipping`);
+      logLine(`[pi-lsp-lite] config "${id}": extensions must be a non-empty string array, skipping`);
       return null;
     }
     override.extensions = raw.extensions.map((e) => e.toLowerCase());
@@ -71,7 +110,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.command !== undefined) {
     if (typeof raw.command !== "string" || raw.command.length === 0) {
-      console.error(`[pi-lsp-lite] config "${id}": command must be a non-empty string, skipping`);
+      logLine(`[pi-lsp-lite] config "${id}": command must be a non-empty string, skipping`);
       return null;
     }
     override.command = raw.command;
@@ -79,7 +118,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.args !== undefined) {
     if (!isStringArray(raw.args)) {
-      console.error(`[pi-lsp-lite] config "${id}": args must be a string array, skipping`);
+      logLine(`[pi-lsp-lite] config "${id}": args must be a string array, skipping`);
       return null;
     }
     override.args = raw.args;
@@ -87,7 +126,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.rootPatterns !== undefined) {
     if (!isStringArray(raw.rootPatterns)) {
-      console.error(`[pi-lsp-lite] config "${id}": rootPatterns must be a string array, skipping`);
+      logLine(`[pi-lsp-lite] config "${id}": rootPatterns must be a string array, skipping`);
       return null;
     }
     override.rootPatterns = raw.rootPatterns;
@@ -120,19 +159,19 @@ async function readConfigFile(path: string): Promise<UserConfig | null> {
     content = await readFile(path, "utf-8");
   } catch (err: unknown) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return null;
-    console.error(`[pi-lsp-lite] failed to read config ${path}:`, err);
+    logLine(`[pi-lsp-lite] failed to read config ${path}:`, err);
     return null;
   }
 
   try {
     const parsed: unknown = JSON.parse(content);
     if (!isPlainObject(parsed)) {
-      console.error(`[pi-lsp-lite] config ${path}: expected a JSON object, skipping`);
+      logLine(`[pi-lsp-lite] config ${path}: expected a JSON object, skipping`);
       return null;
     }
     return parsed as UserConfig;
   } catch (err) {
-    console.error(`[pi-lsp-lite] config ${path}: invalid JSON, skipping:`, err);
+    logLine(`[pi-lsp-lite] config ${path}: invalid JSON, skipping:`, err);
     return null;
   }
 }
@@ -186,7 +225,7 @@ function mergeConfigs(
       if (source === "project") {
         for (const field of ["command", "args", "extensions", "rootPatterns"] as const) {
           if (lspFields[field] !== undefined) {
-            console.error(`[pi-lsp-lite] project config cannot override "${field}" for server "${id}" — ignoring (use global config instead)`);
+            logLine(`[pi-lsp-lite] project config cannot override "${field}" for server "${id}" — ignoring (use global config instead)`);
             delete lspFields[field];
           }
         }
@@ -197,11 +236,11 @@ function mergeConfigs(
       result.set(id, { ...existing, ...defined });
     } else {
       if (source === "project") {
-        console.error(`[pi-lsp-lite] project config cannot define new server "${id}" — only global config (~/.pi-lsp-lite.json) can add servers`);
+        logLine(`[pi-lsp-lite] project config cannot define new server "${id}" — only global config (~/.pi-lsp-lite.json) can add servers`);
         continue;
       }
       if (!override.command || !override.extensions) {
-        console.error(`[pi-lsp-lite] config "${id}" must have at least "command" and "extensions" to define a new server, skipping`);
+        logLine(`[pi-lsp-lite] config "${id}" must have at least "command" and "extensions" to define a new server, skipping`);
         continue;
       }
       result.set(id, {
@@ -284,6 +323,7 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
   const perServerTimeout = new Map<string, number>();
   let diagnosticTimeout = DEFAULT_DIAGNOSTIC_TIMEOUT;
   let documentIdleTimeout = DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  let ui: UiChannel[] = [...DEFAULT_UI_MODE];
 
   const layers: [UserConfig | null, ConfigSource][] = [
     [globalConfig, "global"],
@@ -305,7 +345,11 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
     if (layer.documentIdleTimeout !== undefined) {
       documentIdleTimeout = clamp(layer.documentIdleTimeout, MIN_DOCUMENT_IDLE_TIMEOUT, MAX_DOCUMENT_IDLE_TIMEOUT, documentIdleTimeout);
     }
+    if (layer.ui !== undefined) {
+      const channels = normalizeUiMode(layer.ui);
+      if (channels) ui = channels;
+    }
   }
 
-  return { servers, diagnosticTimeout, documentIdleTimeout, perServerTimeout };
+  return { servers, diagnosticTimeout, documentIdleTimeout, perServerTimeout, ui };
 }

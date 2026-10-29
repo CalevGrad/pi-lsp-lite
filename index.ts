@@ -1,24 +1,30 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
-import { formatDiagnostics } from "./src/format.js";
+import { formatDiagnosticsCompact, formatStatusLine } from "./src/format.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
-import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
+import { loadConfig, writeGlobalConfig, readGlobalConfig, DEFAULT_UI_MODE, type UiChannel } from "./src/config.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
+import { logLine, recentLogLines } from "./src/log.js";
 import { resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
+  let uiChannels: UiChannel[] = [...DEFAULT_UI_MODE];
+  const reportedErrors = new Set<string>();
   let manager = createServerManager({});
+  const STATUS_KEY = "lsp";
+  const WIDGET_KEY = "lsp-diagnostics";
 
   async function initConfig(cwd: string) {
     await manager.shutdownAll();
     const resolved = await loadConfig(cwd);
     servers = resolved.servers;
+    uiChannels = resolved.ui;
     manager = createServerManager({
       diagnosticTimeout: resolved.diagnosticTimeout,
       documentIdleTimeout: resolved.documentIdleTimeout,
@@ -26,7 +32,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     for (const warning of checkExtensionOverlaps(servers)) {
-      console.error(`[pi-lsp-lite] ${warning}`);
+      logLine(`[pi-lsp-lite] ${warning}`);
     }
   }
 
@@ -65,16 +71,29 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
-      const formatted = formatDiagnostics(filePath, result, ctx.cwd);
-      if (!formatted) return;
+      const status = formatStatusLine(filePath, result, ctx.cwd);
+      const block = formatDiagnosticsCompact(filePath, result, ctx.cwd);
 
-      ctx.ui.notify(formatted.trim(), "warning");
+      // Local patch (pi-lsp-lite UI): каналы вывода настраиваются полем `ui`.
+      // notify() пишет в transcript и без планки в 10 строк уводил строку ввода и
+      // футер за край экрана.
+      const widgetLines = block ? block.trim().split("\n") : undefined;
+      ctx.ui.setWidget(WIDGET_KEY, uiChannels.includes("widget") ? widgetLines : undefined);
+      ctx.ui.setStatus(STATUS_KEY, uiChannels.includes("status") ? ctx.ui.theme.fg(status.level, status.text) : undefined);
+      if (uiChannels.includes("chat") && block) ctx.ui.notify(block.trim(), "warning");
+      if (!block) return;
 
       return {
-        content: [...event.content, { type: "text" as const, text: formatted }],
+        content: [...event.content, { type: "text" as const, text: block }],
       };
     } catch (err) {
-      console.error("[pi-lsp-lite]", err);
+      const text = err instanceof Error ? err.message : String(err);
+      logLine(`[pi-lsp-lite] diagnostics failed for ${filePath}: ${err instanceof Error ? err.stack ?? text : text}`);
+      // Один текст — одно уведомление, иначе падающий сервер забьёт экран.
+      if (!reportedErrors.has(text)) {
+        reportedErrors.add(text);
+        ctx.ui.notify(`pi-lsp-lite: ${text} — /lsp-log`, "error");
+      }
     }
   });
 
@@ -128,6 +147,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(lines.join("\n"), "warning");
+    },
+  });
+
+  pi.registerCommand("lsp-log", {
+    description: "Show recent extension log lines (language server output, config warnings)",
+    handler: async (args, ctx) => {
+      const parsed = Number.parseInt(args?.trim() ?? "", 10);
+      const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(200, parsed)) : 20;
+      const lines = recentLogLines(limit);
+      if (lines.length === 0) {
+        ctx.ui.notify("pi-lsp-lite: log is empty (set PI_LSP_DEBUG=1 to mirror it to stderr)", "info");
+        return;
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 

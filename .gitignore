@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 dist/
 .idea/
+run_pi.sh
+.vscode/

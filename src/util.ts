@@ -2,6 +2,7 @@ import { access } from "node:fs/promises";
 import { join, dirname, relative, isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import which_ from "which";
+import { logLine } from "./log.js";
 
 export function fileUri(absolutePath: string): string {
   return pathToFileURL(absolutePath).href;
@@ -19,7 +20,7 @@ export async function which(command: string): Promise<string | null> {
     return await which_(command);
   } catch (err) {
     if (!isNotFoundError(err)) {
-      console.error(`[pi-lsp-lite] failed to resolve command "${command}":`, err);
+      logLine(`[pi-lsp-lite] failed to resolve command "${command}":`, err);
     }
     return null;
   }
