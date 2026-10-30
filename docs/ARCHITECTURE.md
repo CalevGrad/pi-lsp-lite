@@ -98,6 +98,10 @@ Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case to
 
 `findWorkspaceRoot()` walks up from the edited file looking for root markers (`go.mod`, `Cargo.toml`, `tsconfig.json`, `package.json`), bounded by the session's `cwd`. Different roots spawn different server instances, keyed by `${languageId}:${root}`.
 
+### clangd compilation database
+
+clangd searches only the parent directories of a source file for `compile_commands.json`, so a build tree in a sibling or nested directory (`build/`, `out/gcc/`) is missed. For a server whose `command` is `clangd`, the manager walks the session `cwd` (falling back to the workspace root) up to 4 levels deep, picks the directory with the newest `compile_commands.json`, and appends `--compile-commands-dir=<dir>` to argv. A `--compile-commands-dir` already present in configured `args` wins: the walk is skipped entirely, because clangd keeps the *last* occurrence of the flag and would otherwise prefer the auto-detected directory over the configured one.
+
 ### Server lifecycle
 
 - Lazy start on first relevant edit

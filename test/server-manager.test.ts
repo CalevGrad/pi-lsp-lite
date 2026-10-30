@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createServerManager } from "../src/server-manager.js";
+import { createServerManager, hasCompileCommandsDirArg } from "../src/server-manager.js";
 import type { LanguageServerConfig } from "../src/languages.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -385,5 +385,20 @@ describe("Retry logic", () => {
     assert.ok(elapsed < 2_000, `should not have retried, took ${elapsed}ms`);
 
     await manager.shutdownAll();
+  });
+});
+
+describe("hasCompileCommandsDirArg", () => {
+  it("detects the = form and the separated form", () => {
+    assert.equal(hasCompileCommandsDirArg(["--compile-commands-dir=/src/build"]), true);
+    assert.equal(hasCompileCommandsDirArg(["--compile-commands-dir", "/src/build"]), true);
+    assert.equal(hasCompileCommandsDirArg(["-compile-commands-dir=/src/build"]), true);
+    assert.equal(hasCompileCommandsDirArg(["--log=error", "--compile-commands-dir=/src/build"]), true);
+  });
+
+  it("returns false when argv does not pin the database", () => {
+    assert.equal(hasCompileCommandsDirArg([]), false);
+    assert.equal(hasCompileCommandsDirArg(["--log=error", "--limit-results=0"]), false);
+    assert.equal(hasCompileCommandsDirArg(["--include-cleaner-headers=compile-commands-dir"]), false);
   });
 });

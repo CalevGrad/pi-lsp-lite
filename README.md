@@ -82,6 +82,8 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 
 Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
 
+`args` replaces the built-in argv; it does not append to it. One clangd detail: pi-lsp-lite looks for `compile_commands.json` under the session cwd (up to 4 levels, newest file wins) and passes `--compile-commands-dir` to clangd. Put `--compile-commands-dir=<dir>` in global `args` to pin a database yourself — the search is then skipped and your value is the only one clangd sees.
+
 ## How it works
 
 1. Agent writes/edits a file

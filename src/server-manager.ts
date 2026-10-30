@@ -53,6 +53,13 @@ export interface ServerManagerOptions {
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 
+export function hasCompileCommandsDirArg(args: readonly string[]): boolean {
+  return args.some((arg) => {
+    const name = arg.replace(/^-+/, "");
+    return name === "compile-commands-dir" || name.startsWith("compile-commands-dir=");
+  });
+}
+
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
   const diagnosticTimeout = options.diagnosticTimeout ?? DEFAULT_DIAGNOSTIC_TIMEOUT;
   const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
@@ -166,17 +173,17 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     let args = config.args;
     if (config.command === "clangd") {
-      // findWorkspaceRoot stops at the *nearest* root pattern (e.g. a per-app
-      // CMakeLists.txt), so `root` can be a subdir of the workspace while the
-      // build tree with compile_commands.json sits at the outer workspace
-      // root. Search from cwd first (it contains root), then fall back to root.
-      let dbDir = await findCompileCommandsDir(cwd ?? root);
-      if (!dbDir && cwd && cwd !== root) {
-        dbDir = await findCompileCommandsDir(root);
-      }
-      if (dbDir) {
-        logLine(`[pi-lsp-lite:cpp:${root}] using compile_commands.json from ${dbDir}`);
-        args = [...args, `--compile-commands-dir=${dbDir}`];
+      if (hasCompileCommandsDirArg(args)) {
+        logLine(`[pi-lsp-lite:cpp:${root}] --compile-commands-dir set in config, auto-detect skipped`);
+      } else {
+        let dbDir = await findCompileCommandsDir(cwd ?? root);
+        if (!dbDir && cwd && cwd !== root) {
+          dbDir = await findCompileCommandsDir(root);
+        }
+        if (dbDir) {
+          logLine(`[pi-lsp-lite:cpp:${root}] using compile_commands.json from ${dbDir}`);
+          args = [...args, `--compile-commands-dir=${dbDir}`];
+        }
       }
     }
     const child = spawn(binaryPath, args, {
