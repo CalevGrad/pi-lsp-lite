@@ -82,7 +82,7 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 
 Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
 
-`args` replaces the built-in argv; it does not append to it. One clangd detail: pi-lsp-lite looks for `compile_commands.json` under the session cwd (up to 4 levels, newest file wins) and passes `--compile-commands-dir` to clangd. Put `--compile-commands-dir=<dir>` in global `args` to pin a database yourself — the search is then skipped and your value is the only one clangd sees.
+`args` replaces the built-in argv; it does not append to it. One clangd detail: pi-lsp-lite looks for `compile_commands.json` starting at the session cwd and falling back to the workspace root (up to 4 levels, newest file wins) and passes `--compile-commands-dir` to clangd. Two things turn that search off, in this order: `--compile-commands-dir=<dir>` in your global `args`, and a `CompileFlags: CompilationDatabase:` entry in a project `.clangd` file. When you pin a directory yourself it is the only one clangd sees, so point it at a real build tree — a wrong path is reported in `/lsp-log` and clangd silently falls back to guessing flags.
 
 ## How it works
 

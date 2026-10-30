@@ -5,9 +5,9 @@ import { createLspClient, type LspClient, type DiagnosticResult } from "./client
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import type { Diagnostic } from "vscode-languageserver-protocol";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { access, readdir, readFile, stat } from "node:fs/promises";
 import { type Dirent } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { logLine } from "./log.js";
 
 interface ManagedServer {
@@ -53,11 +53,89 @@ export interface ServerManagerOptions {
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 
-export function hasCompileCommandsDirArg(args: readonly string[]): boolean {
-  return args.some((arg) => {
-    const name = arg.replace(/^-+/, "");
-    return name === "compile-commands-dir" || name.startsWith("compile-commands-dir=");
-  });
+/**
+ * Reads clangd's compilation-database flag out of argv.
+ * clangd keeps the *last* occurrence of `--compile-commands-dir`, so an
+ * auto-detected value appended after a configured one would silently win; the
+ * last occurrence is what this reports. `pinned` covers
+ * `--compile-commands-dir=<dir>`, the separated `--compile-commands-dir <dir>`,
+ * and the single-dash spelling LLVM accepts. `dir` stays undefined when the flag
+ * carries no value — a value token that is itself an option
+ * (`--compile-commands-dir --log=error`) does not count.
+ */
+export function readCompileCommandsDirArg(args: readonly string[]): { pinned: boolean; dir: string | undefined } {
+  // A leading dash is required: without it a plain value that happens to read
+  // "compile-commands-dir" would look like the flag and disable auto-detect.
+  const flag = /^-{1,2}compile-commands-dir(?:=|$)/;
+  let pinned = false;
+  let dir: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!flag.test(arg)) continue;
+    const eq = arg.indexOf("=");
+    pinned = true;
+    if (eq >= 0) {
+      dir = arg.slice(eq + 1) || undefined;
+      continue;
+    }
+    const next = args[i + 1];
+    dir = next !== undefined && !next.startsWith("-") ? next : undefined;
+  }
+  return { pinned, dir };
+}
+
+/**
+ * True when a clangd project config (`.clangd`) sets CompileFlags.CompilationDatabase.
+ * clangd then chooses the database itself, and a CLI `--compile-commands-dir`
+ * would override that choice, so auto-detection must stay out of the way.
+ * Scans every directory in `dirs` (nearest first): clangd merges the `.clangd`
+ * files of all ancestors and only the winning *value* differs, so we need to
+ * know that some of them sets the key. The value itself is clangd's business.
+ */
+export async function readCompilationDatabaseFromDotClangd(dirs: readonly string[]): Promise<boolean> {
+  for (const dir of dirs) {
+    let text: string;
+    try {
+      text = await readFile(join(dir, ".clangd"), "utf-8");
+    } catch (err: unknown) {
+      const code = typeof err === "object" && err !== null && "code" in err ? (err as { code?: string }).code : undefined;
+      if (code !== "ENOENT") {
+        logLine(`[pi-lsp-lite:cpp] failed to read .clangd in ${dir}:`, err);
+      }
+      continue;
+    }
+    if (setsCompilationDatabaseKey(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Line-scanner for `CompileFlags:` → `CompilationDatabase:` in a `.clangd` file.
+ * A full YAML parser is not worth a dependency for a presence check; this
+ * handles comments, nesting by indentation and blank lines.
+ */
+function setsCompilationDatabaseKey(text: string): boolean {
+  let inCompileFlags = false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/(^|\s)#.*$/, "");
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      inCompileFlags = line.trim().startsWith("CompileFlags:");
+      continue;
+    }
+    if (inCompileFlags && /^CompilationDatabase\s*:/.test(line.trim())) return true;
+  }
+  return false;
+}
+
+async function hasCompileCommandsFile(dir: string): Promise<boolean> {
+  try {
+    await access(join(dir, "compile_commands.json"));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
@@ -173,9 +251,26 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     let args = config.args;
     if (config.command === "clangd") {
-      if (hasCompileCommandsDirArg(args)) {
-        logLine(`[pi-lsp-lite:cpp:${root}] --compile-commands-dir set in config, auto-detect skipped`);
+      const configured = readCompileCommandsDirArg(args);
+      const dotClangdDirs = cwd && cwd !== root ? [root, cwd] : [root];
+      if (configured.pinned) {
+        if (configured.dir === undefined) {
+          logLine(`[pi-lsp-lite:cpp:${root}] --compile-commands-dir in config has no value, auto-detect skipped`);
+        } else {
+          // clangd resolves a relative path against its own cwd, which is `root` here.
+          const pinnedDir = isAbsolute(configured.dir) ? configured.dir : resolve(root, configured.dir);
+          logLine(`[pi-lsp-lite:cpp:${root}] --compile-commands-dir=${pinnedDir} set in config, auto-detect skipped`);
+          if (!(await hasCompileCommandsFile(pinnedDir))) {
+            logLine(`[pi-lsp-lite:cpp:${root}] warning: ${pinnedDir} has no compile_commands.json; clangd will fall back to parent-directory lookup`);
+          }
+        }
+      } else if (await readCompilationDatabaseFromDotClangd(dotClangdDirs)) {
+        logLine(`[pi-lsp-lite:cpp:${root}] .clangd sets CompileFlags.CompilationDatabase, auto-detect skipped`);
       } else {
+        // findWorkspaceRoot stops at the *nearest* root pattern (e.g. a per-app
+        // CMakeLists.txt), so `root` can be a subdir of the workspace while the
+        // build tree with compile_commands.json sits at the outer workspace
+        // root. Search from cwd first (it contains root), then fall back to root.
         let dbDir = await findCompileCommandsDir(cwd ?? root);
         if (!dbDir && cwd && cwd !== root) {
           dbDir = await findCompileCommandsDir(root);

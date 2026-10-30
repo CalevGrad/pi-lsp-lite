@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createServerManager, hasCompileCommandsDirArg } from "../src/server-manager.js";
+import { createServerManager, readCompileCommandsDirArg, readCompilationDatabaseFromDotClangd } from "../src/server-manager.js";
 import type { LanguageServerConfig } from "../src/languages.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -388,17 +388,80 @@ describe("Retry logic", () => {
   });
 });
 
-describe("hasCompileCommandsDirArg", () => {
-  it("detects the = form and the separated form", () => {
-    assert.equal(hasCompileCommandsDirArg(["--compile-commands-dir=/src/build"]), true);
-    assert.equal(hasCompileCommandsDirArg(["--compile-commands-dir", "/src/build"]), true);
-    assert.equal(hasCompileCommandsDirArg(["-compile-commands-dir=/src/build"]), true);
-    assert.equal(hasCompileCommandsDirArg(["--log=error", "--compile-commands-dir=/src/build"]), true);
+describe("readCompileCommandsDirArg", () => {
+  it("reads the = form, the separated form and the single-dash form", () => {
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir=/src/build"]), { pinned: true, dir: "/src/build" });
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir", "/src/build"]), { pinned: true, dir: "/src/build" });
+    assert.deepEqual(readCompileCommandsDirArg(["-compile-commands-dir=/src/build"]), { pinned: true, dir: "/src/build" });
+    assert.deepEqual(readCompileCommandsDirArg(["--log=error", "--compile-commands-dir=/src/build"]), { pinned: true, dir: "/src/build" });
   });
 
-  it("returns false when argv does not pin the database", () => {
-    assert.equal(hasCompileCommandsDirArg([]), false);
-    assert.equal(hasCompileCommandsDirArg(["--log=error", "--limit-results=0"]), false);
-    assert.equal(hasCompileCommandsDirArg(["--include-cleaner-headers=compile-commands-dir"]), false);
+  it("pins without a value when the flag has none", () => {
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir"]), { pinned: true, dir: undefined });
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir="]), { pinned: true, dir: undefined });
+    // the next token is another option, not a value
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir", "--log=error"]), { pinned: true, dir: undefined });
+  });
+
+  it("reports the last occurrence, which is what clangd honors", () => {
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir=/a", "--compile-commands-dir=/b"]), { pinned: true, dir: "/b" });
+    assert.deepEqual(readCompileCommandsDirArg(["--compile-commands-dir", "/a", "--compile-commands-dir=/b"]), { pinned: true, dir: "/b" });
+  });
+
+  it("returns pinned:false when argv does not pin the database", () => {
+    assert.deepEqual(readCompileCommandsDirArg([]), { pinned: false, dir: undefined });
+    assert.deepEqual(readCompileCommandsDirArg(["--log=error", "--limit-results=0"]), { pinned: false, dir: undefined });
+    // a *value* that reads like the flag is not the flag
+    assert.deepEqual(readCompileCommandsDirArg(["--log", "compile-commands-dir"]), { pinned: false, dir: undefined });
+    assert.deepEqual(readCompileCommandsDirArg(["--include-cleaner-headers=compile-commands-dir"]), { pinned: false, dir: undefined });
+  });
+});
+
+describe("readCompilationDatabaseFromDotClangd", () => {
+  async function makeProject(contents: string | null): Promise<string> {
+    const dir = await makeTempDir();
+    if (contents !== null) await writeFile(join(dir, ".clangd"), contents);
+    return dir;
+  }
+
+  it("detects CompilationDatabase inside the CompileFlags block", async () => {
+    const dir = await makeProject("CompileFlags:\n  Add: [-Wall]\n  CompilationDatabase: build/\nDiagnostics:\n  UnusedIncludes: None\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([dir]), true);
+  });
+
+  it("ignores the key outside CompileFlags and commented-out keys", async () => {
+    const otherBlock = await makeProject("Diagnostics:\n  CompilationDatabase: build/\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([otherBlock]), false);
+
+    const commented = await makeProject("CompileFlags:\n  # CompilationDatabase: build/\n  Add: [-Wall]\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([commented]), false);
+
+    const emptyFile = await makeProject("");
+    assert.equal(await readCompilationDatabaseFromDotClangd([emptyFile]), false);
+  });
+
+  it("accepts commented values, quoted values and an empty value", async () => {
+    const inlineComment = await makeProject("CompileFlags:\n  CompilationDatabase: build/ # out-of-source\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([inlineComment]), true);
+
+    const quoted = await makeProject("CompileFlags:\n  CompilationDatabase: \"out/gcc\"\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([quoted]), true);
+
+    const emptyValue = await makeProject("CompileFlags:\n  CompilationDatabase:\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([emptyValue]), true);
+  });
+
+  it("treats a missing or unreadable .clangd as no setting", async () => {
+    const dir = await makeProject(null);
+    assert.equal(await readCompilationDatabaseFromDotClangd([dir]), false);
+    assert.equal(await readCompilationDatabaseFromDotClangd([join(dir, "does-not-exist")]), false);
+    assert.equal(await readCompilationDatabaseFromDotClangd([]), false);
+  });
+
+  it("is true when any searched directory sets the key", async () => {
+    const root = await makeProject("CompileFlags:\n  Add: [-Wall]\n");
+    const cwd = await makeProject("CompileFlags:\n  CompilationDatabase: ../build\n");
+    assert.equal(await readCompilationDatabaseFromDotClangd([root, cwd]), true);
+    assert.equal(await readCompilationDatabaseFromDotClangd([root]), false);
   });
 });

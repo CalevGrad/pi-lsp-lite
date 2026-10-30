@@ -100,7 +100,18 @@ Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case to
 
 ### clangd compilation database
 
-clangd searches only the parent directories of a source file for `compile_commands.json`, so a build tree in a sibling or nested directory (`build/`, `out/gcc/`) is missed. For a server whose `command` is `clangd`, the manager walks the session `cwd` (falling back to the workspace root) up to 4 levels deep, picks the directory with the newest `compile_commands.json`, and appends `--compile-commands-dir=<dir>` to argv. A `--compile-commands-dir` already present in configured `args` wins: the walk is skipped entirely, because clangd keeps the *last* occurrence of the flag and would otherwise prefer the auto-detected directory over the configured one.
+clangd searches only the parent directories of a source file for `compile_commands.json`, so a build tree in a sibling or nested directory (`build/`, `out/gcc/`) is missed. For a server whose `command` is `clangd`, the manager decides the database directory in this order:
+
+| Priority | Source | Effect |
+|----------|--------|--------|
+| 1 | `--compile-commands-dir` in configured `args` | used as-is, no search; relative paths resolve against the workspace root (clangd's own cwd); a directory without `compile_commands.json` logs a warning |
+| 2 | `CompileFlags: CompilationDatabase:` in a `.clangd` project config | no search — clangd owns the choice, and a CLI flag would override it |
+| 3 | search from the session `cwd`, then the workspace root | up to 4 levels deep, newest `compile_commands.json` wins, `--compile-commands-dir=<dir>` is appended |
+| 4 | nothing found | clangd starts without the flag, as before |
+
+The search is skipped rather than overridden because clangd keeps the *last* occurrence of the flag — an appended value would silently win over the configured one. `.clangd` is read from the workspace root and then the session `cwd`; only the presence of the key matters, path resolution stays clangd's job.
+
+Known gaps: a `CompilationDatabase` in the user-level config (`~/.config/clangd/config.yaml`) is not detected, and the whole rule keys on the exact command name `clangd`, so a wrapper (`clangd-15`, an absolute path) gets neither auto-detection nor these warnings.
 
 ### Server lifecycle
 
