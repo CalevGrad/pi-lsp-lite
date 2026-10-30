@@ -46,6 +46,7 @@ describe("buildServerStates", () => {
           uptime: 5_000,
           openDocuments: 2,
           lastActivity: Date.now(),
+          args: [],
         },
       ],
       installRegistry,
@@ -107,7 +108,7 @@ describe("formatServerStates", () => {
         enabled: true,
         installed: true,
         installable: true,
-        running: [{ id: "typescript", root: "/repo", pid: 123, uptime: 5_000, openDocuments: 2, lastActivity: Date.now() }],
+        running: [{ id: "typescript", root: "/repo", pid: 123, uptime: 5_000, openDocuments: 2, lastActivity: Date.now(), args: ["--stdio"] }],
       },
       {
         id: "lua",
@@ -120,6 +121,7 @@ describe("formatServerStates", () => {
     ]);
 
     assert.match(output, /typescript — enabled — installed — running pid=123 root=\/repo/);
+    assert.match(output, /args=--stdio/);
     assert.match(output, /lua — enabled — missing — not running — cmd=lua-language-server — manual install required/);
   });
 });
