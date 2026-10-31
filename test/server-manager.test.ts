@@ -467,6 +467,30 @@ describe("ServerManager compilation database", () => {
     await manager.shutdownAll();
   });
 
+  it("finds the database of the enclosing repository, not of the subproject", async () => {
+    // Regression: 59 nested CMakeLists.txt make findWorkspaceRoot return
+    // apps/drone_hinter, which has no build/ of its own. Discovery must anchor on
+    // the file, so the repository database still wins.
+    const manager = createServerManager();
+    const repo = await makeTempDir();
+    const sub = join(repo, "apps", "tool");
+    const source = join(sub, "src", "main.cpp");
+    await writeFile(join(repo, "CMakeLists.txt"), "project(repo)\n");
+    await mkdir(join(sub), { recursive: true });
+    await writeFile(join(sub, "CMakeLists.txt"), "project(tool)\n");
+    await mkdir(join(sub, "src"), { recursive: true });
+    await writeFile(source, "int main() { return 0; }");
+    await writeDatabase(repo, "debug-x64", source);
+
+    await manager.handleEdit(source, cppLikeConfig, repo);
+
+    const status = manager.status()[0];
+    assert.notEqual(status.root, repo, "the subproject is what rootPatterns resolve to");
+    assert.equal(cdbArg(status), `--compile-commands-dir=${join(repo, "build/debug-x64")}`);
+
+    await manager.shutdownAll();
+  });
+
   it("restarts when a compilation database appears mid-session", async () => {
     const manager = createServerManager();
     const dir = await makeCppProject();

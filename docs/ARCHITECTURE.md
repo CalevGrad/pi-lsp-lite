@@ -111,20 +111,33 @@ So `build/debug-x64/compile_commands.json`, which is what CMake produces for a
 named build directory, is invisible to clangd. It then falls back to
 `clang file.cpp` and reports every project include as missing.
 
-`compile-commands.ts` handles that:
+`compile-commands.ts` runs this pipeline, cheapest check first:
 
-1. `findNativeCdb()` replays clangd's probe, including a `.clangd` fragment that
-   pins `CompilationDatabase`. If clangd would find something, discovery does
-   nothing — `--compile-commands-dir` disables clangd's own ancestor search, so
-   intervening where it is not needed would break working projects.
-2. Otherwise `discoverCandidates()` walks the literal prefix of each `cdbGlobs`
-   pattern (default `build/**/compile_commands.json`) down to `cdbMaxDepth`, and
-   drops candidates outside the workspace root or that are not a JSON array
-   clangd could load.
-3. `pickCandidate()` chooses. A single candidate is taken as-is. With several,
-   "the edited file is listed in exactly one of them" is the only safe signal;
-   otherwise the newest database wins and the choice is reported. Ties break by
-   shallowest path, then by path, so behaviour stays reproducible.
+```
+1. user config      cdbAutoDiscover off, or --compile-commands-dir /
+                    --compile_args_from in args   → stay out
+2. clangd itself    findNativeCdb() replays clangd's probe over the file's
+                    ancestors: compile_commands.json,
+                    build/compile_commands.json, compile_flags.txt, plus a
+                    .clangd that pins CompilationDatabase   → stay out
+3. discovery        ancestorsUpTo(file, cwd): the file's own directory upward,
+                    nearest first; the first ancestor holding a valid database
+                    wins, which is clangd's own "nearer beats further" rule
+4. choice           pickCandidate()
+```
+
+Step 3 anchors on the **file**, never on the workspace root. The root comes from
+`rootPatterns`, and in a repository with dozens of nested `CMakeLists.txt` that
+marker resolves to a subproject which has no `build/` of its own — the search
+then finds nothing and clangd silently loses its flags. `cwd` is the lower bound:
+climbing further would let one stray `~/build/compile_commands.json` hijack every
+project. Candidates outside the bound are dropped, as are files clangd could not
+load (not JSON, not an array).
+
+`pickCandidate()`: a single candidate is taken as-is. With several, "the edited
+file is listed in exactly one of them" is the only safe signal; otherwise the
+newest database wins and the choice is reported. Ties break by shallowest path,
+then by path, so behaviour stays reproducible.
 
 4. The choice is **sticky per server process**. clangd accepts one
    `--compile-commands-dir`, so two files in one workspace that resolve to
@@ -135,8 +148,8 @@ named build directory, is invisible to clangd. It then falls back to
    left alone.
 
 The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn and
-shown by `/lsp-status`. Lookups are cached per server + root + file for 30 s, the
-interval clangd itself uses to re-probe a missing database. Only the directory
+shown by `/lsp-status`. Lookups are cached per server + root + cwd + file for
+30 s, the interval clangd itself uses to re-probe a missing database. Only the directory
 needs a new process; content changes are clangd's own business — it re-reads the
 file every 5 s. Restarts are throttled to one per 10 s per workspace so a
 churning build tree cannot spawn loops. `restart()` (the `/lsp-restart` command)

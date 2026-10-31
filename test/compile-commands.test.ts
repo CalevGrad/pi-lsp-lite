@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile, symlink, utimes } from "node:fs/promises
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  ancestorsUpTo,
   findNativeCdb,
   discoverCandidates,
   pickCandidate,
@@ -324,7 +325,7 @@ describe("resolveCompileCommandsDir", () => {
     await write(join(root, "src/main.cpp"));
 
     const result = await resolveCompileCommandsDir(root, join(root, "src/main.cpp"), { enabled: false });
-    assert.deepEqual(result, { dir: null, reason: "disabled", candidates: [], outsideRoot: [] });
+    assert.deepEqual(result, { dir: null, reason: "disabled", root: null, candidates: [], outsideRoot: [] });
   });
 
   it("reports outside-root when that is the only thing found", async () => {
@@ -338,6 +339,105 @@ describe("resolveCompileCommandsDir", () => {
     const result = await resolveCompileCommandsDir(root, join(root, "src/main.cpp"));
     assert.equal(result.dir, null);
     assert.equal(result.reason, "outside-root");
+  });
+});
+
+describe("ancestorsUpTo", () => {
+  it("starts at the file's directory and stops at the bound", async () => {
+    const root = await makeTempDir();
+    const file = join(root, "apps/tool/src/main.cpp");
+    await write(file);
+    assert.deepEqual(ancestorsUpTo(file, root), [
+      join(root, "apps/tool/src"),
+      join(root, "apps/tool"),
+      join(root, "apps"),
+      root,
+    ]);
+  });
+
+  it("returns a single directory when the file is outside the bound", async () => {
+    const root = await makeTempDir();
+    const outside = join(await makeTempDir(), "elsewhere/main.cpp");
+    await write(outside);
+    assert.deepEqual(ancestorsUpTo(outside, root), [dirname(outside)]);
+  });
+
+  it("never lists the same directory twice", async () => {
+    const root = await makeTempDir();
+    const file = join(root, "main.cpp");
+    await write(file);
+    const roots = ancestorsUpTo(file, root);
+    assert.deepEqual(roots, [root]);
+  });
+});
+
+describe("searching the ancestors", () => {
+  it("finds a database above a subproject, which is what rootPatterns cannot see", async () => {
+    const repo = await makeTempDir();
+    const sub = join(repo, "apps/drone_hinter");
+    const source = join(sub, "src/main.cpp");
+    await write(join(repo, "CMakeLists.txt"));
+    await write(join(sub, "CMakeLists.txt"));
+    await write(source);
+    await write(
+      join(repo, "build/debug-x64/compile_commands.json"),
+      database([source]),
+    );
+
+    // pi-lsp-lite would call this workspace rooted at `sub`; discovery anchors on the file.
+    const roots = ancestorsUpTo(source, repo);
+    const result = await resolveCompileCommandsDir(roots, source);
+    assert.equal(result.dir, join(repo, "build/debug-x64"));
+    assert.equal(result.root, repo);
+    assert.equal(result.reason, "single");
+  });
+
+  it("prefers the nearest ancestor's database", async () => {
+    const repo = await makeTempDir();
+    const source = join(repo, "apps/tool/src/main.cpp");
+    await write(source);
+    await write(join(repo, "apps/tool/build/dbg/compile_commands.json"), database([source]));
+    await write(join(repo, "build/dbg/compile_commands.json"), database([source]));
+
+    const result = await resolveCompileCommandsDir(ancestorsUpTo(source, repo), source);
+    assert.equal(result.dir, join(repo, "apps/tool/build/dbg"));
+    assert.equal(result.root, join(repo, "apps/tool"));
+  });
+
+  it("stops at the bound and ignores a database above it", async () => {
+    const parent = await makeTempDir();
+    const repo = join(parent, "repo");
+    const source = join(repo, "src/main.cpp");
+    await write(source);
+    await write(join(parent, "build/dbg/compile_commands.json"), database([source]));
+
+    const result = await resolveCompileCommandsDir(ancestorsUpTo(source, repo), source);
+    assert.equal(result.dir, null);
+    assert.equal(result.reason, "not-found");
+  });
+
+  it("reports a database once, even when two anchors can both see it", async () => {
+    const repo = await makeTempDir();
+    const source = join(repo, "deep/nested/main.cpp");
+    await write(source);
+    await write(join(repo, "deep/nested/build/dbg/compile_commands.json"), database([source]));
+
+    const result = await resolveCompileCommandsDir(ancestorsUpTo(source, repo), source, {
+      globs: ["**/build/**/compile_commands.json"],
+      maxDepth: 8,
+    });
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.root, join(repo, "deep/nested"));
+  });
+
+  it("keeps log paths relative to the ancestor that matched", async () => {
+    const repo = await makeTempDir();
+    const source = join(repo, "apps/tool/src/main.cpp");
+    await write(source);
+    await write(join(repo, "apps/tool/build/dbg/compile_commands.json"), database([source]));
+
+    const result = await resolveCompileCommandsDir(ancestorsUpTo(source, repo), source);
+    assert.match(describeResolution(result, repo) ?? "", /build\/dbg/);
   });
 });
 
@@ -369,12 +469,28 @@ describe("argument injection", () => {
     assert.equal(applied.resolution.reason, "disabled");
   });
 
+  it("does not search the filesystem when the user pinned a database", async () => {
+    const root = await makeTempDir();
+    const source = join(root, "src/main.cpp");
+    await write(join(root, "build/debug-x64/compile_commands.json"), database([source]));
+    await write(source);
+
+    const pinned = { ...cppServer, cdbAutoDiscover: true, args: ["--compile-commands-dir=/mine"] };
+    const applied = await applyCompileCommandsDiscovery(pinned, ancestorsUpTo(source, root), source);
+    assert.equal(applied.resolution.reason, "user-pinned");
+    assert.deepEqual(applied.config.args, ["--compile-commands-dir=/mine"]);
+  });
+
   it("appends the discovered directory for an opted-in server", async () => {
     const root = await makeTempDir();
     await write(join(root, "build/debug-x64/compile_commands.json"), database([]));
     await write(join(root, "src/main.cpp"));
 
-    const applied = await applyCompileCommandsDiscovery({ ...cppServer, cdbAutoDiscover: true }, root, join(root, "src/main.cpp"));
+    const applied = await applyCompileCommandsDiscovery(
+      { ...cppServer, cdbAutoDiscover: true },
+      ancestorsUpTo(join(root, "src/main.cpp"), root),
+      join(root, "src/main.cpp"),
+    );
     assert.deepEqual(applied.config.args, [`--compile-commands-dir=${join(root, "build/debug-x64")}`]);
   });
 });

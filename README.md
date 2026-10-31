@@ -102,9 +102,13 @@ clangd then parses every file with a bare `clang file.cpp` and reports your own
 headers as missing.
 
 The extension notices that and passes `--compile-commands-dir=<that directory>`
-to clangd. If it finds several databases and cannot tell which one describes the
-file you are editing, it takes the newest and says so on stderr; pin the choice
-in that case:
+to clangd. It searches from the edited file's own directory upward, as far as the
+working directory, and the nearest `build/` holding a database wins — the same
+rule clangd uses. Nothing is searched at all when you have pinned a directory
+yourself, or when clangd can already find a database.
+
+If it finds several databases and cannot tell which one describes the file you are
+editing, it takes the newest and says so on stderr; pin the choice in that case:
 
 ```json
 // <project>/.pi-lsp-lite.json
