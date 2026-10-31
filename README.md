@@ -37,7 +37,7 @@ The agent sees these too — they're appended to the tool result, so it can self
 | Command | What it does |
 |---------|-------------|
 | `/lsp-status` | Show running servers, PIDs, workspace roots, uptime, and the argv they run with |
-| `/lsp-diag` | Show all current diagnostics (or `/lsp-diag path/to/file` for one file) |
+| `/lsp-log` | Show the extension log — config problems, spawned servers, server stderr (`/lsp-log cpp` to filter, `/lsp-log clear` to empty) |
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |
@@ -108,7 +108,8 @@ rule clangd uses. Nothing is searched at all when you have pinned a directory
 yourself, or when clangd can already find a database.
 
 If it finds several databases and cannot tell which one describes the file you are
-editing, it takes the newest and says so on stderr; pin the choice in that case:
+editing, it takes the newest and records that choice in the log, which `/lsp-log`
+shows; pin the choice in that case:
 
 ```json
 // <project>/.pi-lsp-lite.json

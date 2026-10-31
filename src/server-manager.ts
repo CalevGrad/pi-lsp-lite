@@ -1,6 +1,7 @@
 import { type ChildProcess } from "node:child_process";
 import spawn from "cross-spawn";
 import { which, fileUri, findWorkspaceRoot } from "./util.js";
+import { errText, log } from "./log.js";
 import { createLspClient, type LspClient, type DiagnosticResult } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import {
@@ -13,7 +14,6 @@ import {
   type AppliedCdb,
   type CdbResolution,
 } from "./compile-commands.js";
-import type { Diagnostic } from "vscode-languageserver-protocol";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
 import { readFile, stat } from "node:fs/promises";
 
@@ -39,7 +39,6 @@ interface ManagedServer {
 export interface ServerManager {
   handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult>;
   status(): ServerStatus[];
-  getAllDiagnostics(): Map<string, Diagnostic[]>;
   /** Stops running servers (all, or only one id) so the next edit respawns them with current config. */
   restart(id?: string): Promise<number>;
   shutdownAll(): Promise<void>;
@@ -166,7 +165,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     const binaryPath = await which(config.command);
     if (!binaryPath) {
-      console.error(`[pi-lsp-lite:${config.id}] ${config.command} not found on PATH, disabling ${config.id}`);
+      log.warning(config.id, `${config.command} not found on PATH, disabling ${config.id}`);
       disabledBinaries.add(config.id);
       return null;
     }
@@ -177,11 +176,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      console.error(`[pi-lsp-lite:${config.id}:${root}]`, chunk.toString().trimEnd());
+      log.info(`${config.id}:${root}`, chunk.toString().trimEnd());
     });
 
     child.on("error", (err) => {
-      console.error(`[pi-lsp-lite:${config.id}:${root}] process error:`, err);
+      log.error(`${config.id}:${root}`, `process error: ${errText(err)}`);
     });
 
     const client = createLspClient(child);
@@ -196,7 +195,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       clearTimeout(initTimer!);
     } catch (err) {
       clearTimeout(initTimer!);
-      console.error(`[pi-lsp-lite:${config.id}:${root}] failed to initialize:`, err);
+      log.error(`${config.id}:${root}`, `failed to initialize: ${errText(err)}`);
       await killProcess(child);
       client.shutdown().catch(() => {});
       failedRoots.add(serverKey);
@@ -276,7 +275,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     const fullKey = `${id}|${key}`;
     if (cdbAnnounced.has(fullKey)) return;
     cdbAnnounced.add(fullKey);
-    console.error(`[pi-lsp-lite:${id}]`, message);
+    log.info(id, message);
   }
 
   function announceCdb(id: string, root: string, resolution: CdbResolution): void {
@@ -381,7 +380,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         announceOnce(config.id, `cdb-throttled|${serverKey}`, `compilation database changed (${change}); restart suppressed, run /lsp-restart to force it`);
         return existing;
       }
-      console.error(`[pi-lsp-lite:${config.id}] compilation database changed (${change}), restarting`);
+      log.info(config.id, `compilation database changed (${change}), restarting`);
       await shutdownServer(existing);
       return spawnOnce(replacement.config, root, serverKey, replacement.resolution);
     }
@@ -458,16 +457,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         lastActivity: s.lastActivity,
         args: [...s.args],
       }));
-    },
-
-    getAllDiagnostics(): Map<string, Diagnostic[]> {
-      const result = new Map<string, Diagnostic[]>();
-      for (const server of servers.values()) {
-        for (const [uri, diags] of server.client.getAllDiagnostics()) {
-          result.set(uri, diags);
-        }
-      }
-      return result;
     },
 
     async restart(id?: string): Promise<number> {

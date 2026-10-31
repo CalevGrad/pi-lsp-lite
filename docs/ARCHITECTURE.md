@@ -16,6 +16,7 @@ src/
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
   format.ts            → diagnostic formatting for agent consumption
+  log.ts               → in-memory diagnostic log, shown by /lsp-log
   util.ts              → file URI, binary lookup, workspace root detection
 test/
   fake-server.ts       → minimal LSP server for unit tests
@@ -198,7 +199,7 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 | `tool_result` | Intercept write/edit results, append diagnostics |
 | `session_start` | Load config, create server manager |
 | `session_shutdown` | Kill all servers |
-| `registerCommand` | `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| `registerCommand` | `/lsp-status`, `/lsp-log`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
 
 ## Adding a language
 

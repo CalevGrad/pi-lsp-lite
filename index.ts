@@ -2,14 +2,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostics } from "./src/format.js";
-import { DiagnosticSeverity } from "vscode-languageserver-protocol";
 import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
-import { fileUri, which, isInsideCwd } from "./src/util.js";
+import { which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
+import { errText, formatLogEntry, log } from "./src/log.js";
 import { resolve } from "node:path";
 import { realpath } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+
+const LOG_TAIL_LINES = 30;
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
@@ -26,7 +27,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     for (const warning of checkExtensionOverlaps(servers)) {
-      console.error(`[pi-lsp-lite] ${warning}`);
+      log.warning("config", warning);
     }
   }
 
@@ -74,7 +75,7 @@ export default function (pi: ExtensionAPI) {
         content: [...event.content, { type: "text" as const, text: formatted }],
       };
     } catch (err) {
-      console.error("[pi-lsp-lite]", err);
+      log.error("tool_result", errText(err));
     }
   });
 
@@ -105,45 +106,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("lsp-diag", {
-    description: "Show current LSP diagnostics for all tracked files (or a specific file)",
+  pi.registerCommand("lsp-log", {
+    description: "Show the extension log, optionally filtered by a word, or clear it with 'clear'",
     handler: async (args, ctx) => {
-      const allDiags = manager.getAllDiagnostics();
+      const query = args?.trim().toLowerCase();
 
-      if (allDiags.size === 0) {
-        ctx.ui.notify("pi-lsp-lite: no diagnostics", "info");
+      if (query === "clear") {
+        const dropped = log.entries().length;
+        log.clear();
+        ctx.ui.notify(`pi-lsp-lite: log cleared, ${dropped} ${dropped === 1 ? "entry" : "entries"} dropped`, "info");
         return;
       }
 
-      const filterPath = args?.trim();
-      let filterUri: string | undefined;
-      if (filterPath) {
-        const abs = resolve(ctx.cwd, filterPath);
-        filterUri = fileUri(abs);
-      }
+      const matched = query
+        ? log.entries().filter((entry) => `${entry.scope} ${entry.message}`.toLowerCase().includes(query))
+        : log.entries();
+      const shown = matched.slice(-LOG_TAIL_LINES);
 
-      const lines: string[] = [];
-      for (const [uri, diags] of allDiags) {
-        if (filterUri && uri !== filterUri) continue;
-        const filePath = fileURLToPath(new URL(uri));
-        const relevant = diags.filter((d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning);
-        if (relevant.length === 0) continue;
-        lines.push(`${filePath} (${relevant.length} diagnostic${relevant.length !== 1 ? "s" : ""})`);
-        for (const d of relevant) {
-          const severity = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-          const line = d.range.start.line + 1;
-          const col = d.range.start.character + 1;
-          const source = d.source ? `[${d.source}] ` : "";
-          lines.push(`  ${severity} ${line}:${col} ${source}${d.message}`);
-        }
-      }
-
-      if (lines.length === 0) {
-        ctx.ui.notify(filterPath ? `pi-lsp-lite: no diagnostics for ${filterPath}` : "pi-lsp-lite: no diagnostics", "info");
+      if (shown.length === 0) {
+        ctx.ui.notify(query ? `pi-lsp-lite: no log entries match "${query}"` : "pi-lsp-lite: log is empty", "info");
         return;
       }
 
-      ctx.ui.notify(lines.join("\n"), "warning");
+      const hidden = matched.length - shown.length;
+      const summary = `${shown.length}/${matched.length} entries${query ? ` matching "${query}"` : ""}${hidden > 0 ? `, ${hidden} older hidden` : ""}`;
+      ctx.ui.notify([summary, ...shown.map(formatLogEntry)].join("\n"), "warning");
     },
   });
 
