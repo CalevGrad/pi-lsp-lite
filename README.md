@@ -155,6 +155,11 @@ Notes:
 Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
 that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`.
 
+The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
+for other files, errors first, one line per diagnostic — long clangd template errors fold into one line.
+The summary above them still counts everything, so `137 errors` and `... and 117 more diagnostics in this
+file` appear in the same report.
+
 Servers are lazy (spawn on first edit), idle-shutdown after 240s, and clean up on session end.
 
 ## Development
