@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostics } from "./src/format.js";
@@ -7,6 +7,7 @@ import { which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
 import { errText, formatLogEntry, log } from "./src/log.js";
+import { formatFooterStatus, type LspHealth } from "./src/footer.js";
 import { resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
@@ -15,6 +16,18 @@ const LOG_TAIL_LINES = 30;
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
   let manager = createServerManager({});
+  let health: LspHealth = "unknown";
+
+  function updateFooter(ctx: ExtensionContext) {
+    const checked = manager.status().reduce((sum, server) => sum + server.openDocuments, 0);
+    const state = { ...manager.diagnosticSummary(), checked, health };
+    ctx.ui.setStatus("lsp", formatFooterStatus(state, ctx.ui.theme));
+  }
+
+  function clearFooter(ctx: ExtensionContext) {
+    health = "unknown";
+    ctx.ui.setStatus("lsp", undefined);
+  }
 
   async function initConfig(cwd: string) {
     await manager.shutdownAll();
@@ -44,6 +57,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await initConfig(ctx.cwd);
+    clearFooter(ctx);
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -66,6 +80,8 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
+      health = result.status;
+      updateFooter(ctx);
       const formatted = formatDiagnostics(filePath, result, ctx.cwd);
       if (!formatted) return;
 
@@ -95,6 +111,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const id = args?.trim();
       const stopped = await manager.restart(id || undefined);
+      clearFooter(ctx);
       if (stopped === 0) {
         ctx.ui.notify(id ? `pi-lsp-lite: no running server "${id}"` : "pi-lsp-lite: no servers running", "info");
         return;
@@ -176,6 +193,7 @@ export default function (pi: ExtensionAPI) {
       const resolved = await which(command);
       await writeGlobalConfig({ servers: { [id]: { command, args, extensions, rootPatterns } } });
       await initConfig(ctx.cwd);
+      clearFooter(ctx);
 
       if (!resolved) {
         ctx.ui.notify(`pi-lsp-lite: configured server "${id}", but "${command}" is missing from PATH — install it manually before use`, "warning");
@@ -207,6 +225,7 @@ export default function (pi: ExtensionAPI) {
 
       await writeGlobalConfig({ servers: { [selected]: { disabled: true } } });
       await initConfig(ctx.cwd);
+      clearFooter(ctx);
       ctx.ui.notify(`pi-lsp-lite: disabled server "${selected}"`, "info");
     },
   });
@@ -252,6 +271,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       await initConfig(ctx.cwd);
+      clearFooter(ctx);
 
       if (isCurrentlyEnabled) {
         ctx.ui.notify(`pi-lsp-lite: disabled server "${id}"`, "info");

@@ -15,6 +15,7 @@ import {
   type CdbResolution,
 } from "./compile-commands.js";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
+import { DiagnosticSeverity } from "vscode-languageserver-protocol";
 import { readFile, stat } from "node:fs/promises";
 
 interface ManagedServer {
@@ -39,9 +40,18 @@ interface ManagedServer {
 export interface ServerManager {
   handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult>;
   status(): ServerStatus[];
+  /** Error and warning totals over every live server, for the footer. */
+  diagnosticSummary(): DiagnosticSummary;
   /** Stops running servers (all, or only one id) so the next edit respawns them with current config. */
   restart(id?: string): Promise<number>;
   shutdownAll(): Promise<void>;
+}
+
+export interface DiagnosticSummary {
+  errors: number;
+  warnings: number;
+  /** Files holding at least one error or warning. */
+  files: number;
 }
 
 export interface ServerStatus {
@@ -457,6 +467,26 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         lastActivity: s.lastActivity,
         args: [...s.args],
       }));
+    },
+
+    diagnosticSummary(): DiagnosticSummary {
+      let errors = 0;
+      let warnings = 0;
+      let files = 0;
+      for (const server of servers.values()) {
+        for (const diags of server.client.getAllDiagnostics().values()) {
+          let fileErrors = 0;
+          let fileWarnings = 0;
+          for (const d of diags) {
+            if (d.severity === DiagnosticSeverity.Error) fileErrors++;
+            else if (d.severity === DiagnosticSeverity.Warning) fileWarnings++;
+          }
+          if (fileErrors + fileWarnings > 0) files++;
+          errors += fileErrors;
+          warnings += fileWarnings;
+        }
+      }
+      return { errors, warnings, files };
     },
 
     async restart(id?: string): Promise<number> {

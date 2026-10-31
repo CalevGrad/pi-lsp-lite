@@ -32,6 +32,22 @@ That's it. If you have `gopls`, `rust-analyzer`, `typescript-language-server`, `
 
 The agent sees these too — they're appended to the tool result, so it can self-correct on the same turn.
 
+Pi's footer carries the running total while you work:
+
+```
+LSP: 2 errors, 1 warning in 3 files   errors red, warnings yellow
+LSP: ✓ clean                          green, nothing left in the analyzed files
+LSP: ⚠ incomplete                     the server timed out, the count may be low
+LSP: ✗ server unavailable             the binary is missing or failed to start
+```
+
+The `LSP:` label itself takes the color of the worst severity: red while any error stands, yellow when
+only warnings are left.
+
+The count covers the files the servers analyzed in this session — the ones you edited — not the whole
+project. Nothing appears before the first edit, so the footer never calls code clean that it has not
+looked at; after that it keeps the last measurement it made.
+
 ## Commands
 
 | Command | What it does |

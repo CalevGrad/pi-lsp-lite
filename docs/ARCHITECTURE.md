@@ -16,6 +16,7 @@ src/
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
   format.ts            → diagnostic formatting for agent consumption
+  footer.ts            → one-line footer status (counts, clean, degraded states)
   log.ts               → in-memory diagnostic log, shown by /lsp-log
   util.ts              → file URI, binary lookup, workspace root detection
 test/
@@ -35,6 +36,7 @@ agent calls write/edit
   → client.ts: send didOpen/didChange, wait for publishDiagnostics
   → format.ts: filter to errors+warnings, format text, add cross-file footer
   → index.ts: append formatted text to tool_result content
+  → server-manager.diagnosticSummary(): totals over live servers → footer.ts → ctx.ui.setStatus("lsp", ...)
 ```
 
 ## Key design choices
@@ -200,6 +202,7 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 | `session_start` | Load config, create server manager |
 | `session_shutdown` | Kill all servers |
 | `registerCommand` | `/lsp-status`, `/lsp-log`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| `setStatus` | one-line footer total: errors, warnings, clean, timeout, unavailable |
 
 ## Adding a language
 
