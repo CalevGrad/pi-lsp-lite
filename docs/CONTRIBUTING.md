@@ -55,7 +55,7 @@ npm run test:integration
 
 1. Add a config entry to `src/languages.ts`
 2. Add an integration test in `test/integration/<server>.test.ts`
-3. Update the prerequisites table in `README.md`
+3. Update the "Supported servers" table in `README.md`
 
 ## Code style
 

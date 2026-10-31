@@ -35,8 +35,8 @@ agent calls write/edit
   → server-manager.ts: find workspace root, ensure server, queue edit
   → client.ts: send didOpen/didChange, wait for publishDiagnostics
   → format.ts: filter to errors+warnings, format text, add cross-file footer
-  → index.ts: append formatted text to tool_result content
   → server-manager.diagnosticSummary(): totals over live servers → footer.ts → ctx.ui.setStatus("lsp", ...)
+  → index.ts: append formatted text to tool_result content
 ```
 
 ## Key design choices
@@ -150,8 +150,8 @@ then by path, so behaviour stays reproducible.
    the server has none and one turns up. A rival database is reported once and
    left alone.
 
-The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn and
-shown by `/lsp-status`. Lookups are cached per server + root + cwd + file for
+The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn, and `/lsp-status` prints the
+argv of each running server, that flag included. Lookups are cached per server + root + cwd + file for
 30 s, the interval clangd itself uses to re-probe a missing database. Only the directory
 needs a new process; content changes are clangd's own business — it re-reads the
 file every 5 s. Restarts are throttled to one per 10 s per workspace so a
@@ -160,14 +160,14 @@ drops the cache and the notices, so the next edit re-reads everything.
 
 ### Workspace root detection
 
-`findWorkspaceRoot()` walks up from the edited file looking for root markers (`go.mod`, `Cargo.toml`, `tsconfig.json`, `package.json`), bounded by the session's `cwd`. Different roots spawn different server instances, keyed by `${languageId}:${root}`.
+`findWorkspaceRoot()` walks up from the edited file looking for root markers (`go.mod`; `Cargo.toml`; `tsconfig.json`, `package.json`; `pyproject.toml`, `setup.py`, `requirements.txt`; `compile_commands.json`, `CMakeLists.txt`, `.clangd`), bounded by the session's `cwd`. Different roots spawn different server instances, keyed by `${config.id}:${root}`.
 
 ### Server lifecycle
 
 - Lazy start on first relevant edit
 - Idle shutdown after 240s of no edits
 - Periodic 60s sweep closes documents idle > 120s
-- Session shutdown uses SIGTERM → SIGKILL escalation with 5s grace
+- Session shutdown sends the LSP `shutdown` request (5 s cap), then escalates SIGTERM → SIGKILL with a 2 s grace
 
 ### Failure isolation
 

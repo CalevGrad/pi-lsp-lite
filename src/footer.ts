@@ -1,6 +1,6 @@
 import type { DiagnosticSummary } from "./server-manager.js";
 
-/** What the last edit told us about the language server itself. */
+/** What the language servers last told us; "unknown" until the first edit of the session. */
 export type LspHealth = "ok" | "timeout" | "unavailable" | "unknown";
 
 /** The subset of Pi's theme the footer needs. */

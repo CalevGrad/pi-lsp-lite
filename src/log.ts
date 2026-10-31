@@ -12,7 +12,7 @@ export interface LogEntry {
   seq: number;
   time: Date;
   level: LogLevel;
-  /** Server id, or `"<id>:<root>"` for a process, or "" for extension-wide lines. */
+  /** What the line is about: a server id, `"<id>:<root>"` for one process, or an area such as `"config"`. */
   scope: string;
   message: string;
 }

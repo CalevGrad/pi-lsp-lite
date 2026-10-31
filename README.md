@@ -27,7 +27,7 @@ That's it. If you have `gopls`, `rust-analyzer`, `typescript-language-server`, `
   ⚠ LSP diagnostics for src/main.go (2 errors):
     error 12:5 [compiler] undefined: foo
     error 18:2 [compiler] too many arguments in call to bar
-    + 1 diagnostic in 1 other file
+    src/util.go (1 error): error 7:3 [compiler] undefined: parseConfig
 ```
 
 The agent sees these too — they're appended to the tool result, so it can self-correct on the same turn.
@@ -35,7 +35,7 @@ The agent sees these too — they're appended to the tool result, so it can self
 Pi's footer carries the running total while you work:
 
 ```
-LSP: 2 errors, 1 warning in 3 files   errors red, warnings yellow
+LSP: 2 errors, 1 warning, in 3 files  errors red, warnings yellow
 LSP: ✓ clean                          green, nothing left in the analyzed files
 LSP: ⚠ incomplete                     the server timed out, the count may be low
 LSP: ✗ server unavailable             the binary is missing or failed to start
@@ -141,7 +141,7 @@ Notes:
 - Generate the database with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, `ninja -t compdb > compile_commands.json`, or `bear -- <build command>`.
 - Nothing is touched when clangd can already find a database, or when `.clangd` pins one with `CompileFlags.CompilationDatabase` — pointing clangd at one directory switches off its own search.
 - Set `"cdbAutoDiscover": false` to switch this off entirely.
-- `/lsp-status` shows the directory in effect. A database that appears mid-session is picked up automatically; `/lsp-restart cpp` forces it immediately.
+- `/lsp-status` prints the `--compile-commands-dir=…` the running clangd was spawned with. A database that appears mid-session is picked up automatically; `/lsp-restart cpp` forces it immediately.
 
 ## How it works
 
@@ -150,9 +150,10 @@ Notes:
 3. Spawns (or reuses) an LSP server for that language + root
 4. Sends `didChange`, waits for `publishDiagnostics`
 5. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
-6. Filters to errors + warnings, formats, appends to tool result + shows in TUI
+6. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
-Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, you see "+ N diagnostics in M other files".
+Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
+that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`.
 
 Servers are lazy (spawn on first edit), idle-shutdown after 240s, and clean up on session end.
 

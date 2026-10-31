@@ -61,15 +61,7 @@ export interface ServerStatus {
   uptime: number;
   openDocuments: number;
   lastActivity: number;
-}
-
-export interface ServerStatus {
-  id: string;
-  root: string;
-  pid: number;
-  uptime: number;
-  openDocuments: number;
-  lastActivity: number;
+  /** argv the process was actually spawned with. */
   args: string[];
 }
 
