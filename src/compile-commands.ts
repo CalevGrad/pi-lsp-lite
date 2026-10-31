@@ -37,6 +37,7 @@ export interface CdbCandidate {
 
 export type CdbReason =
   | "disabled"
+  | "user-pinned"
   | "native-database"
   | "native-config"
   | "not-found"
@@ -50,6 +51,8 @@ export interface CdbResolution {
   /** Directory to pass as --compile-commands-dir, or null to leave clangd alone. */
   dir: string | null;
   reason: CdbReason;
+  /** Which ancestor the search stopped at; the base for paths in log messages. */
+  root: string | null;
   /** Valid candidates, sorted by the tie-break order used for selection. */
   candidates: CdbCandidate[];
   chosen?: CdbCandidate;
@@ -81,6 +84,31 @@ function pathKey(absolutePath: string): string {
 function isInside(child: string, parent: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Directories to search, nearest first: the file's own directory up to and
+ * including `stopAt`. clangd anchors on the file, never on a workspace root, so
+ * discovery must too — a root inferred from markers such as CMakeLists.txt can
+ * land in a subproject that has no build/ of its own.
+ */
+export function ancestorsUpTo(filePath: string, stopAt: string): string[] {
+  const stop = resolve(stopAt);
+  const start = resolve(dirname(filePath));
+  // A file outside the workspace gets one anchor: never climb above it looking
+  // for someone else's build tree.
+  if (!isInside(start, stop)) return [start];
+
+  const roots: string[] = [];
+  let dir = start;
+  for (;;) {
+    roots.push(dir);
+    if (dir === stop) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return roots;
 }
 
 /** Workspace-relative path with forward slashes, as globs are written. */
@@ -299,11 +327,14 @@ export async function discoverCandidates(
   root: string,
   filePath: string,
   options: CdbOptions = {},
+  boundRoot: string = root,
 ): Promise<{ candidates: CdbCandidate[]; outsideRoot: string[] }> {
   const globs = options.globs ?? DEFAULT_CDB_GLOBS;
   const maxDepth = Math.max(1, options.maxDepth ?? DEFAULT_CDB_MAX_DEPTH);
 
-  const realRoot = await realpath(root).catch(() => resolve(root));
+  // Candidates stay inside the outermost search root, not inside the anchor that
+  // happened to match: a symlinked build/ pointing elsewhere is still a guess.
+  const realRoot = await realpath(boundRoot).catch(() => resolve(boundRoot));
   const matches = await collectFiles(root, compileGlobs(globs), maxDepth);
   const candidates: CdbCandidate[] = [];
   const outsideRoot: string[] = [];
@@ -361,39 +392,61 @@ export function pickCandidate(candidates: CdbCandidate[]): { chosen: CdbCandidat
 }
 
 /**
- * Entry point: decide what clangd needs for `filePath` rooted at `root`.
- * Returns dir=null whenever clangd can already find a database or the project
- * pins one itself, because --compile-commands-dir disables clangd's own
- * ancestor search outright.
+ * Entry point: decide what clangd needs for `filePath`.
+ *
+ * `searchRoots` are the directories to probe, nearest first (see ancestorsUpTo);
+ * the first one that holds a valid database wins, which is clangd's own rule that
+ * a nearer database beats a further one. Returns dir=null whenever clangd can
+ * already find a database or the project pins one itself, because
+ * --compile-commands-dir disables clangd's own ancestor search outright.
  */
 export async function resolveCompileCommandsDir(
-  root: string,
+  searchRoots: string | string[],
   filePath: string,
   options: CdbOptions = {},
 ): Promise<CdbResolution> {
   if (options.enabled === false) {
-    return { dir: null, reason: "disabled", candidates: [], outsideRoot: [] };
+    return { dir: null, reason: "disabled", root: null, candidates: [], outsideRoot: [] };
   }
 
   const native = await findNativeCdb(filePath);
   if (native.database) {
-    return { dir: null, reason: "native-database", candidates: [], outsideRoot: [] };
+    return { dir: null, reason: "native-database", root: null, candidates: [], outsideRoot: [] };
   }
   if (native.config) {
-    return { dir: null, reason: "native-config", candidates: [], outsideRoot: [] };
+    return { dir: null, reason: "native-config", root: null, candidates: [], outsideRoot: [] };
   }
 
-  const { candidates, outsideRoot } = await discoverCandidates(root, filePath, options);
-  const { chosen, reason } = pickCandidate(candidates);
-  if (!chosen) {
-    return {
-      dir: null,
-      reason: outsideRoot.length > 0 ? "outside-root" : reason,
-      candidates,
-      outsideRoot,
-    };
+  const roots = Array.isArray(searchRoots) ? searchRoots : [searchRoots];
+  const bound = roots.length > 0 ? roots[roots.length - 1] : process.cwd();
+  const seen = new Set<string>();
+  const outsideRoot = new Set<string>();
+
+  for (const root of roots) {
+    const found = await discoverCandidates(root, filePath, options, bound);
+    for (const dir of found.outsideRoot) outsideRoot.add(dir);
+
+    // A glob without a literal prefix re-enters the same subtree from every
+    // ancestor; a database is only allowed to be reported once, by its nearest anchor.
+    const candidates = found.candidates.filter((c) => {
+      if (seen.has(c.file)) return false;
+      seen.add(c.file);
+      return true;
+    });
+    if (candidates.length === 0) continue;
+
+    const { chosen, reason } = pickCandidate(candidates);
+    if (!chosen) continue;
+    return { dir: chosen.dir, reason, root, candidates, chosen, outsideRoot: [...outsideRoot] };
   }
-  return { dir: chosen.dir, reason, candidates, chosen, outsideRoot };
+
+  return {
+    dir: null,
+    reason: outsideRoot.size > 0 ? "outside-root" : "not-found",
+    root: null,
+    candidates: [],
+    outsideRoot: [...outsideRoot],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -427,17 +480,19 @@ export function withCompileCommandsArg(config: LanguageServerConfig, dir: string
 
 export async function applyCompileCommandsDiscovery(
   config: LanguageServerConfig,
-  root: string,
+  searchRoots: string | string[],
   filePath: string,
 ): Promise<AppliedCdb> {
-  if (!isDiscoveryEnabled(config)) {
-    return {
-      config,
-      resolution: { dir: null, reason: "disabled", candidates: [], outsideRoot: [] },
-    };
-  }
+  // Cheapest checks first, and both are user intent: an opt-out, then a database
+  // the user already pointed at. Neither should touch the filesystem.
+  const refused = (reason: CdbReason): AppliedCdb => ({
+    config,
+    resolution: { dir: null, reason, root: null, candidates: [], outsideRoot: [] },
+  });
+  if (!isDiscoveryEnabled(config)) return refused("disabled");
+  if (hasExplicitCompileCommandsArg(config.args)) return refused("user-pinned");
 
-  const resolution = await resolveCompileCommandsDir(root, filePath, {
+  const resolution = await resolveCompileCommandsDir(searchRoots, filePath, {
     enabled: config.cdbAutoDiscover,
     globs: config.cdbGlobs,
     maxDepth: config.cdbMaxDepth,
@@ -448,7 +503,8 @@ export async function applyCompileCommandsDiscovery(
 
 /** Human-readable explanation for the log; null when there is nothing to report. */
 export function describeResolution(resolution: CdbResolution, root: string): string | null {
-  const rel = (path: string) => toSlashPath(root, path);
+  const base = resolution.root ?? root;
+  const rel = (path: string) => toSlashPath(base, path);
   const chosen = resolution.chosen;
 
   if (!chosen) {

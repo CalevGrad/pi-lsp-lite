@@ -4,8 +4,10 @@ import { which, fileUri, findWorkspaceRoot } from "./util.js";
 import { createLspClient, type LspClient, type DiagnosticResult } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import {
+  ancestorsUpTo,
   applyCompileCommandsDiscovery,
   describeResolution,
+  hasExplicitCompileCommandsArg,
   isDiscoveryEnabled,
   withCompileCommandsArg,
   type AppliedCdb,
@@ -239,19 +241,29 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     config: LanguageServerConfig,
     root: string,
     filePath: string,
+    cwd: string,
     options: { force?: boolean; announce?: boolean } = {},
   ): Promise<AppliedCdb> {
-    if (!isDiscoveryEnabled(config)) {
-      return { config, resolution: { dir: null, reason: "disabled", candidates: [], outsideRoot: [] } };
+    // Intentionally before any filesystem work: the user either turned discovery
+    // off or already pinned a database, and in both cases their word wins.
+    const reason = !isDiscoveryEnabled(config)
+      ? "disabled" as const
+      : hasExplicitCompileCommandsArg(config.args)
+        ? "user-pinned" as const
+        : null;
+    if (reason) {
+      return { config, resolution: { dir: null, reason, root: null, candidates: [], outsideRoot: [] } };
     }
 
-    const key = `${config.id}|${root}|${filePath}`;
+    const key = `${config.id}|${root}|${cwd}|${filePath}`;
     const cached = !options.force && cdbCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       return { config: withCompileCommandsArg(config, cached.resolution.dir), resolution: cached.resolution };
     }
 
-    const applied = await applyCompileCommandsDiscovery(config, root, filePath);
+    // Search from the file's own directory upward, like clangd does. The
+    // workspace root comes from rootPatterns and may well be a subproject.
+    const applied = await applyCompileCommandsDiscovery(config, ancestorsUpTo(filePath, cwd), filePath);
     if (cdbCache.size >= MAX_CDB_CACHE_ENTRIES) cdbCache.clear();
     cdbCache.set(key, { resolution: applied.resolution, expiresAt: Date.now() + CDB_REVALIDATE_MS });
     if (options.announce !== false) announceCdb(config.id, root, applied.resolution);
@@ -296,14 +308,15 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     config: LanguageServerConfig,
     root: string,
     filePath: string,
+    cwd: string,
   ): Promise<AppliedCdb | null> {
     if (!existing.cdbDir) {
-      const applied = await resolveCompileCommands(config, root, filePath);
+      const applied = await resolveCompileCommands(config, root, filePath, cwd);
       return applied.resolution.dir ? applied : null;
     }
 
     if (existing.cdbFile && (await databaseFileExists(existing.cdbFile))) {
-      const applied = await resolveCompileCommands(config, root, filePath, { announce: false });
+      const applied = await resolveCompileCommands(config, root, filePath, cwd, { announce: false });
       if (applied.resolution.dir && applied.resolution.dir !== existing.cdbDir) {
         announceOnce(
           config.id,
@@ -322,7 +335,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     // The database we point at is gone: look again, and accept whatever answer
     // comes back, including "none" (clangd then falls back on its own search).
-    return await resolveCompileCommands(config, root, filePath, { force: true });
+    return await resolveCompileCommands(config, root, filePath, cwd, { force: true });
   }
 
   function allowRestart(serverKey: string): boolean {
@@ -350,6 +363,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     config: LanguageServerConfig,
     root: string,
     filePath: string,
+    cwd: string,
   ): Promise<ManagedServer | null> {
     const serverKey = `${config.id}:${root}`;
 
@@ -359,7 +373,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     const existing = servers.get(serverKey);
     if (existing) {
-      const replacement = await decideReplacement(existing, config, root, filePath);
+      const replacement = await decideReplacement(existing, config, root, filePath, cwd);
       if (!replacement) return existing;
 
       const change = `${existing.cdbDir ?? "none"} -> ${replacement.resolution.dir ?? "none"}`;
@@ -372,7 +386,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       return spawnOnce(replacement.config, root, serverKey, replacement.resolution);
     }
 
-    const applied = await resolveCompileCommands(config, root, filePath);
+    const applied = await resolveCompileCommands(config, root, filePath, cwd);
     return spawnOnce(applied.config, root, serverKey, applied.resolution);
   }
 
@@ -422,7 +436,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   return {
     async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
-      const server = await ensureServer(config, root, filePath);
+      const server = await ensureServer(config, root, filePath, cwd);
       if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };
 
       // serialize edits per server to avoid concurrent waitForDiagnostics races

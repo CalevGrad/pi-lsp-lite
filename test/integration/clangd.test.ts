@@ -80,8 +80,11 @@ describe("clangd integration with a nested compilation database", { skip: !proce
     await mkdir(srcDir, { recursive: true });
     await mkdir(buildDir, { recursive: true });
 
+    // The source lives in a subproject with its own CMakeLists.txt, so the
+    // workspace root resolves there and has no build/ of its own.
     mainPath = join(srcDir, "main.cpp");
     await writeFile(join(dir, "CMakeLists.txt"), "project(demo)\n");
+    await writeFile(join(srcDir, "CMakeLists.txt"), "project(demo_src)\n");
     await writeFile(join(includeDir, "widget.h"), "inline int widget_value() { return 42; }\n");
     await writeFile(mainPath, '#include "widget.h"\nint main() { return widget_value(); }\n');
     await writeFile(join(buildDir, "compile_commands.json"), JSON.stringify([
