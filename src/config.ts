@@ -3,6 +3,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type LanguageServerConfig, builtinLanguages } from "./languages.js";
+import { DEFAULT_CDB_MAX_DEPTH } from "./compile-commands.js";
 
 export interface ServerConfigOverride {
   extensions?: string[];
@@ -12,6 +13,9 @@ export interface ServerConfigOverride {
   diagnosticTimeout?: number;
   maxRetries?: number;
   disabled?: boolean;
+  cdbAutoDiscover?: boolean;
+  cdbGlobs?: string[];
+  cdbMaxDepth?: number;
 }
 
 export interface UserConfig {
@@ -37,6 +41,8 @@ const MIN_DOCUMENT_IDLE_TIMEOUT = 10_000;
 const MAX_DOCUMENT_IDLE_TIMEOUT = 600_000;
 const MIN_MAX_RETRIES = 0;
 const MAX_MAX_RETRIES = 10;
+const MIN_CDB_MAX_DEPTH = 1;
+const MAX_CDB_MAX_DEPTH = 8;
 
 function clamp(value: unknown, min: number, max: number, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -108,6 +114,31 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
       MIN_MAX_RETRIES,
       MAX_MAX_RETRIES,
       DEFAULT_MAX_RETRIES,
+    );
+  }
+
+  if (raw.cdbAutoDiscover !== undefined) {
+    if (typeof raw.cdbAutoDiscover !== "boolean") {
+      console.error(`[pi-lsp-lite] config "${id}": cdbAutoDiscover must be a boolean, skipping`);
+      return null;
+    }
+    override.cdbAutoDiscover = raw.cdbAutoDiscover;
+  }
+
+  if (raw.cdbGlobs !== undefined) {
+    if (!isStringArray(raw.cdbGlobs) || raw.cdbGlobs.length === 0) {
+      console.error(`[pi-lsp-lite] config "${id}": cdbGlobs must be a non-empty string array, skipping`);
+      return null;
+    }
+    override.cdbGlobs = raw.cdbGlobs;
+  }
+
+  if (raw.cdbMaxDepth !== undefined) {
+    override.cdbMaxDepth = clamp(
+      raw.cdbMaxDepth,
+      MIN_CDB_MAX_DEPTH,
+      MAX_CDB_MAX_DEPTH,
+      DEFAULT_CDB_MAX_DEPTH,
     );
   }
 
@@ -211,6 +242,9 @@ function mergeConfigs(
         args: override.args ?? [],
         rootPatterns: override.rootPatterns ?? [],
         ...(override.maxRetries !== undefined && { maxRetries: override.maxRetries }),
+        ...(override.cdbAutoDiscover !== undefined && { cdbAutoDiscover: override.cdbAutoDiscover }),
+        ...(override.cdbGlobs !== undefined && { cdbGlobs: override.cdbGlobs }),
+        ...(override.cdbMaxDepth !== undefined && { cdbMaxDepth: override.cdbMaxDepth }),
       });
     }
   }

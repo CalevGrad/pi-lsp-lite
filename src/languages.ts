@@ -7,6 +7,12 @@ export interface LanguageServerConfig {
   diagnosticTimeout?: number;
   maxRetries?: number;
   languageIds?: Record<string, string>;
+  // Compilation database discovery. clangd probes build/ one level deep, so a
+  // database at build/<config>/compile_commands.json is invisible to it; when
+  // that happens this extension points clangd at it with --compile-commands-dir.
+  cdbAutoDiscover?: boolean;
+  cdbGlobs?: string[];
+  cdbMaxDepth?: number;
 }
 
 export const builtinLanguages: LanguageServerConfig[] = [
@@ -49,6 +55,7 @@ export const builtinLanguages: LanguageServerConfig[] = [
     command: "clangd",
     args: [],
     rootPatterns: ["compile_commands.json", "CMakeLists.txt", ".clangd"],
+    cdbAutoDiscover: true,
     diagnosticTimeout: 15_000,
     languageIds: { ".c": "c", ".h": "c", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp" },
   },

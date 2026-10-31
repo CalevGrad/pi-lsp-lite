@@ -36,11 +36,12 @@ The agent sees these too — they're appended to the tool result, so it can self
 
 | Command | What it does |
 |---------|-------------|
-| `/lsp-status` | Show running servers, PIDs, workspace roots, uptime |
+| `/lsp-status` | Show running servers, PIDs, workspace roots, uptime, and the argv they run with |
 | `/lsp-diag` | Show all current diagnostics (or `/lsp-diag path/to/file` for one file) |
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |
+| `/lsp-restart` | Restart a running server (`/lsp-restart cpp`) so it re-reads config and compile commands |
 | `/lsp-install` | Install a missing server binary |
 
 ## Supported servers
@@ -77,10 +78,49 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | `servers.<id>.diagnosticTimeout` | Per-attempt timeout (ms) | per-language |
 | `servers.<id>.maxRetries` | Retry attempts on timeout (0-10) | `3` |
 | `servers.<id>.disabled` | Disable this server | `false` |
+| `servers.<id>.cdbAutoDiscover` | Find a compilation database clangd cannot see (C/C++) | `true` for `cpp` |
+| `servers.<id>.cdbGlobs` | Where to look, relative to the workspace root | `["build/**/compile_commands.json"]` |
+| `servers.<id>.cdbMaxDepth` | How deep to look, in path segments (1-8) | `3` |
 | `diagnosticTimeout` | Global default timeout (ms) | `5000` |
 | `documentIdleTimeout` | Close idle documents after (ms) | `120000` |
 
 Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
+
+### C/C++: finding compile_commands.json
+
+clangd needs the flags your build uses (`-I`, `-D`, `-std`). It reads them from a
+compilation database, and it only looks in three places per directory, walking up
+from the file: `compile_commands.json`, `build/compile_commands.json`,
+`compile_flags.txt`. `build/` is probed **one level deep**, so this is invisible
+to clangd:
+
+```
+project/build/debug-x64/compile_commands.json   ← CMake -B build/debug-x64
+```
+
+clangd then parses every file with a bare `clang file.cpp` and reports your own
+headers as missing.
+
+The extension notices that and passes `--compile-commands-dir=<that directory>`
+to clangd. If it finds several databases and cannot tell which one describes the
+file you are editing, it takes the newest and says so on stderr; pin the choice
+in that case:
+
+```json
+// <project>/.pi-lsp-lite.json
+{
+  "servers": {
+    "cpp": { "cdbGlobs": ["build/debug-*/**/compile_commands.json"] }
+  }
+}
+```
+
+Notes:
+
+- Generate the database with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, `ninja -t compdb > compile_commands.json`, or `bear -- <build command>`.
+- Nothing is touched when clangd can already find a database, or when `.clangd` pins one with `CompileFlags.CompilationDatabase` — pointing clangd at one directory switches off its own search.
+- Set `"cdbAutoDiscover": false` to switch this off entirely.
+- `/lsp-status` shows the directory in effect. A database that appears mid-session is picked up automatically; `/lsp-restart cpp` forces it immediately.
 
 ## How it works
 

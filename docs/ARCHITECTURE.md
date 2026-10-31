@@ -11,6 +11,7 @@ index.ts               → extension entry point
 src/
   config.ts            → config file loading, merge, and write
   languages.ts         → built-in language server defaults
+  compile-commands.ts  → clangd compilation database discovery
   install-registry.ts  → known install commands for built-in servers
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
@@ -93,6 +94,53 @@ Each built-in language server has a default diagnostic timeout calibrated to its
 | clangd | 15s | Fast for single files, slower for projects without compile_commands.json |
 
 Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case total wait for rust-analyzer is 4 × 30s + backoff ≈ 2 minutes. Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout` or per-server `servers.<id>.diagnosticTimeout`).
+
+### C/C++ compilation database discovery
+
+clangd needs a compile command per file. It finds one by probing three names in
+the file's directory and then in every parent directory
+(`clang-tools-extra/clangd/GlobalCompilationDatabase.cpp`, `DirectoryCache`):
+
+```
+<dir>/compile_commands.json
+<dir>/build/compile_commands.json   ← build/ is probed one level deep
+<dir>/compile_flags.txt
+```
+
+So `build/debug-x64/compile_commands.json`, which is what CMake produces for a
+named build directory, is invisible to clangd. It then falls back to
+`clang file.cpp` and reports every project include as missing.
+
+`compile-commands.ts` handles that:
+
+1. `findNativeCdb()` replays clangd's probe, including a `.clangd` fragment that
+   pins `CompilationDatabase`. If clangd would find something, discovery does
+   nothing — `--compile-commands-dir` disables clangd's own ancestor search, so
+   intervening where it is not needed would break working projects.
+2. Otherwise `discoverCandidates()` walks the literal prefix of each `cdbGlobs`
+   pattern (default `build/**/compile_commands.json`) down to `cdbMaxDepth`, and
+   drops candidates outside the workspace root or that are not a JSON array
+   clangd could load.
+3. `pickCandidate()` chooses. A single candidate is taken as-is. With several,
+   "the edited file is listed in exactly one of them" is the only safe signal;
+   otherwise the newest database wins and the choice is reported. Ties break by
+   shallowest path, then by path, so behaviour stays reproducible.
+
+4. The choice is **sticky per server process**. clangd accepts one
+   `--compile-commands-dir`, so two files in one workspace that resolve to
+   different databases must not fight over it, or the server would restart on
+   every alternating edit. A running choice is replaced only when its
+   `compile_commands.json` disappears (clean build, switched generator) or when
+   the server has none and one turns up. A rival database is reported once and
+   left alone.
+
+The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn and
+shown by `/lsp-status`. Lookups are cached per server + root + file for 30 s, the
+interval clangd itself uses to re-probe a missing database. Only the directory
+needs a new process; content changes are clangd's own business — it re-reads the
+file every 5 s. Restarts are throttled to one per 10 s per workspace so a
+churning build tree cannot spawn loops. `restart()` (the `/lsp-restart` command)
+drops the cache and the notices, so the next edit re-reads everything.
 
 ### Workspace root detection
 

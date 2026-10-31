@@ -89,6 +89,22 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("lsp-restart", {
+    description: "Restart a running language server (all of them if no id is given)",
+    handler: async (args, ctx) => {
+      const id = args?.trim();
+      const stopped = await manager.restart(id || undefined);
+      if (stopped === 0) {
+        ctx.ui.notify(id ? `pi-lsp-lite: no running server "${id}"` : "pi-lsp-lite: no servers running", "info");
+        return;
+      }
+      ctx.ui.notify(
+        `pi-lsp-lite: stopped ${stopped} server${stopped !== 1 ? "s" : ""} — the next edit respawns them with current config and compile commands`,
+        "info",
+      );
+    },
+  });
+
   pi.registerCommand("lsp-diag", {
     description: "Show current LSP diagnostics for all tracked files (or a specific file)",
     handler: async (args, ctx) => {

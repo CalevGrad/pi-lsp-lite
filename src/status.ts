@@ -86,7 +86,8 @@ export function formatServerStates(states: ServerState[]): string {
       ? state.running.map((s) => {
         const idle = Math.round((Date.now() - s.lastActivity) / 1000);
         const up = Math.round(s.uptime / 1000);
-        return `running pid=${s.pid} root=${s.root} open=${s.openDocuments} up=${up}s idle=${idle}s`;
+        const args = s.args.length > 0 ? ` args=${s.args.join(",")}` : "";
+        return `running pid=${s.pid} root=${s.root} open=${s.openDocuments} up=${up}s idle=${idle}s${args}`;
       }).join("; ")
       : "not running";
     const command = state.command ? `cmd=${state.command}` : "cmd=unknown";

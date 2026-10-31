@@ -30,6 +30,21 @@ const missingConfig: LanguageServerConfig = {
   rootPatterns: [],
 };
 
+// Stands in for clangd: same opt-in flag, same --compile-commands-dir plumbing,
+// but the fake server does not care what the argument means.
+const cppLikeConfig: LanguageServerConfig = {
+  id: "cpplike",
+  extensions: [".cpp"],
+  command: tsxPath,
+  args: [fakeServerPath, "--run"],
+  rootPatterns: ["CMakeLists.txt"],
+  cdbAutoDiscover: true,
+};
+
+function cdbArg(status: { args: string[] } | undefined): string | undefined {
+  return status?.args.find((arg) => arg.startsWith("--compile-commands-dir="));
+}
+
 let tempDirs: string[] = [];
 
 async function makeTempDir(): Promise<string> {
@@ -383,6 +398,250 @@ describe("Retry logic", () => {
     assert.equal(result.status, "timeout");
     assert.equal(result.retryAttempts, 0);
     assert.ok(elapsed < 2_000, `should not have retried, took ${elapsed}ms`);
+
+    await manager.shutdownAll();
+  });
+});
+
+describe("ServerManager compilation database", () => {
+  async function makeCppProject(): Promise<string> {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "CMakeLists.txt"), "project(demo)\n");
+    return dir;
+  }
+
+  async function writeDatabase(dir: string, config: string, source: string): Promise<void> {
+    const dbDir = join(dir, "build", config);
+    await mkdir(dbDir, { recursive: true });
+    await writeFile(
+      join(dbDir, "compile_commands.json"),
+      JSON.stringify([{ directory: dbDir, file: source, command: `clang++ -Igen -c ${source}` }]),
+    );
+  }
+
+  it("points the server at a database it would not find on its own", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const source = join(dir, "main.cpp");
+    await writeFile(source, "int main() { return 0; }");
+    await writeDatabase(dir, "debug-x64", source);
+
+    const result = await manager.handleEdit(source, cppLikeConfig, dir);
+    assert.equal(result.status, "ok");
+    assert.equal(cdbArg(manager.status()[0]), `--compile-commands-dir=${join(dir, "build/debug-x64")}`);
+
+    await manager.shutdownAll();
+  });
+
+  it("leaves the arguments alone when a root database already exists", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const source = join(dir, "main.cpp");
+    await writeFile(source, "int main() { return 0; }");
+    await writeFile(join(dir, "compile_commands.json"), "[]");
+
+    await manager.handleEdit(source, cppLikeConfig, dir);
+    assert.equal(cdbArg(manager.status()[0]), undefined);
+
+    await manager.shutdownAll();
+  });
+
+  it("does not add a directory when the user pinned one", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const source = join(dir, "main.cpp");
+    await writeFile(source, "int main() { return 0; }");
+    await writeDatabase(dir, "debug-x64", source);
+
+    const pinned: LanguageServerConfig = {
+      ...cppLikeConfig,
+      id: "cppinned",
+      args: [...cppLikeConfig.args, "--compile-commands-dir=/mine"],
+    };
+    await manager.handleEdit(source, pinned, dir);
+
+    const args = manager.status()[0].args;
+    assert.equal(args.filter((arg) => arg.startsWith("--compile-commands-dir=")).length, 1);
+    assert.ok(args.includes("--compile-commands-dir=/mine"));
+
+    await manager.shutdownAll();
+  });
+
+  it("restarts when a compilation database appears mid-session", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const first = join(dir, "a.cpp");
+    const second = join(dir, "b.cpp");
+    await writeFile(first, "int a() { return 0; }");
+    await writeFile(second, "int b() { return 0; }");
+
+    await manager.handleEdit(first, cppLikeConfig, dir);
+    const before = manager.status()[0];
+    assert.equal(cdbArg(before), undefined);
+
+    // First build of the session: the database did not exist when clangd started.
+    // A second file is edited because the lookup for `first` is cached for the
+    // revalidation interval, exactly as it is in a live session.
+    await writeDatabase(dir, "debug-x64", second);
+    await manager.handleEdit(second, cppLikeConfig, dir);
+
+    const after = manager.status()[0];
+    assert.equal(manager.status().length, 1, "the old process must be replaced, not added to");
+    assert.notEqual(after.pid, before.pid);
+    assert.equal(cdbArg(after), `--compile-commands-dir=${join(dir, "build/debug-x64")}`);
+
+    await manager.shutdownAll();
+  });
+
+  it("throttles restarts when the database keeps moving", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const files = ["a.cpp", "b.cpp", "c.cpp"].map((name) => join(dir, name));
+    for (const file of files) await writeFile(file, "int f() { return 0; }");
+    await writeDatabase(dir, "debug-x64", files[0]);
+
+    await manager.handleEdit(files[0], cppLikeConfig, dir);
+    const first = manager.status()[0];
+    assert.match(cdbArg(first) ?? "", /debug-x64$/);
+
+    // Swap the database twice within the cooldown. The first swap restarts clangd,
+    // the second must be refused so that a churning build tree cannot spawn loops.
+    await rm(join(dir, "build/debug-x64"), { recursive: true, force: true });
+    await writeDatabase(dir, "release-x64", files[1]);
+    await manager.handleEdit(files[1], cppLikeConfig, dir);
+    const second = manager.status()[0];
+    assert.notEqual(second.pid, first.pid);
+    assert.match(cdbArg(second) ?? "", /release-x64$/);
+
+    await rm(join(dir, "build/release-x64"), { recursive: true, force: true });
+    await writeDatabase(dir, "relwithdebinfo-x64", files[2]);
+    await manager.handleEdit(files[2], cppLikeConfig, dir);
+    assert.equal(manager.status()[0].pid, second.pid, "cooldown must suppress the second restart");
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps the database in use when another file wants none", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const loose = join(dir, "a.cpp");
+    const covered = join(dir, "sub/b.cpp");
+    await writeFile(loose, "int a() { return 0; }");
+    await mkdir(join(dir, "sub"), { recursive: true });
+    await writeFile(covered, "int b() { return 0; }");
+    await writeDatabase(dir, "debug-x64", loose);
+    // sub/ has its own database, so clangd needs no help for sub/b.cpp.
+    await writeFile(join(dir, "sub/compile_commands.json"), JSON.stringify([
+      { directory: join(dir, "sub"), file: covered, command: "clang++ -c b.cpp" },
+    ]));
+
+    await manager.handleEdit(loose, cppLikeConfig, dir);
+    const first = manager.status()[0];
+    assert.match(cdbArg(first) ?? "", /debug-x64$/);
+
+    await manager.handleEdit(covered, cppLikeConfig, dir);
+    const after = manager.status()[0];
+    assert.equal(after.pid, first.pid, "a file that needs no help must not drop the flag");
+    assert.equal(cdbArg(after), cdbArg(first), "clangd takes one directory; the running choice is sticky");
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps the database in use when a rival one turns up", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const a = join(dir, "a.cpp");
+    const b = join(dir, "b.cpp");
+    await writeFile(a, "int a() { return 0; }");
+    await writeFile(b, "int b() { return 0; }");
+    await writeDatabase(dir, "debug-x64", a);
+    await writeDatabase(dir, "release-x64", b);
+
+    await manager.handleEdit(a, cppLikeConfig, dir);
+    const first = manager.status()[0];
+    assert.match(cdbArg(first) ?? "", /debug-x64$/);
+
+    await manager.handleEdit(b, cppLikeConfig, dir);
+    assert.equal(manager.status()[0].pid, first.pid, "rival databases must not make the server flip-flop");
+    assert.equal(cdbArg(manager.status()[0]), cdbArg(first));
+
+    await manager.shutdownAll();
+  });
+
+  it("restarts again when the database disappears", async () => {
+    const manager = createServerManager();
+    const dir = await makeCppProject();
+    const first = join(dir, "a.cpp");
+    const second = join(dir, "b.cpp");
+    await writeFile(first, "int a() { return 0; }");
+    await writeFile(second, "int b() { return 0; }");
+    await writeDatabase(dir, "debug-x64", first);
+
+    await manager.handleEdit(first, cppLikeConfig, dir);
+    assert.ok(cdbArg(manager.status()[0]));
+
+    await rm(join(dir, "build"), { recursive: true, force: true });
+    await manager.handleEdit(second, cppLikeConfig, dir);
+
+    assert.equal(cdbArg(manager.status()[0]), undefined);
+
+    await manager.shutdownAll();
+  });
+});
+
+describe("ServerManager.restart", () => {
+  it("stops only the matching id", async () => {
+    const other: LanguageServerConfig = { ...fakeConfig, id: "other" };
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const goFile = join(dir, "main.go");
+    const otherFile = join(dir, "other.go");
+    await writeFile(goFile, "package main");
+    await writeFile(otherFile, "package main");
+
+    await manager.handleEdit(goFile, fakeConfig, dir);
+    await manager.handleEdit(otherFile, other, dir);
+    assert.equal(manager.status().length, 2);
+
+    const stopped = await manager.restart("fake");
+    assert.equal(stopped, 1);
+
+    const status = manager.status();
+    assert.equal(status.length, 1);
+    assert.equal(status[0].id, "other");
+
+    await manager.shutdownAll();
+  });
+
+  it("reports zero when nothing matches", async () => {
+    const manager = createServerManager();
+    assert.equal(await manager.restart("never-started"), 0);
+    assert.equal(await manager.restart(), 0);
+    await manager.shutdownAll();
+  });
+
+  it("a restarted server respawns with freshly discovered compile commands", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "CMakeLists.txt"), "project(demo)\n");
+    const source = join(dir, "main.cpp");
+    await writeFile(source, "int main() { return 0; }");
+
+    await manager.handleEdit(source, cppLikeConfig, dir);
+    assert.equal(cdbArg(manager.status()[0]), undefined);
+
+    await mkdir(join(dir, "build/debug-x64"), { recursive: true });
+    await writeFile(
+      join(dir, "build/debug-x64/compile_commands.json"),
+      JSON.stringify([{ directory: join(dir, "build/debug-x64"), file: source, command: "clang++ -c main.cpp" }]),
+    );
+
+    // Same file as before: the restart is what forces a re-probe, not the cache TTL.
+    await manager.restart("cpplike");
+    await manager.handleEdit(source, cppLikeConfig, dir);
+
+    assert.equal(cdbArg(manager.status()[0]), `--compile-commands-dir=${join(dir, "build/debug-x64")}`);
 
     await manager.shutdownAll();
   });

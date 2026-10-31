@@ -338,6 +338,71 @@ describe("loadConfig", () => {
   });
 });
 
+describe("compile command discovery config", () => {
+  it("opts the cpp server in and leaves others out", async () => {
+    const dir = await makeTempDir();
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(config.servers.find((s) => s.id === "cpp")?.cdbAutoDiscover, true);
+    assert.equal(config.servers.find((s) => s.id === "go")?.cdbAutoDiscover, undefined);
+  });
+
+  it("project config can narrow where the database is searched", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      servers: { cpp: { cdbGlobs: ["build/debug-*/**/compile_commands.json"], cdbMaxDepth: 4 } },
+    }));
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    const cpp = config.servers.find((s) => s.id === "cpp");
+    assert.deepEqual(cpp?.cdbGlobs, ["build/debug-*/**/compile_commands.json"]);
+    assert.equal(cpp?.cdbMaxDepth, 4);
+    assert.equal(cpp?.cdbAutoDiscover, true, "unmentioned fields keep their value");
+    assert.deepEqual(cpp?.rootPatterns, ["compile_commands.json", "CMakeLists.txt", ".clangd"]);
+  });
+
+  it("project config overrides a global disable", async () => {
+    const dir = await makeTempDir();
+    const globalPath = join(dir, "global.json");
+    await writeFile(globalPath, JSON.stringify({ servers: { cpp: { cdbAutoDiscover: false } } }));
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      servers: { cpp: { cdbAutoDiscover: true } },
+    }));
+
+    const config = await loadConfig(dir, globalPath);
+    assert.equal(config.servers.find((s) => s.id === "cpp")?.cdbAutoDiscover, true);
+  });
+
+  it("a global disable survives a project config that only sets globs", async () => {
+    const dir = await makeTempDir();
+    const globalPath = join(dir, "global.json");
+    await writeFile(globalPath, JSON.stringify({ servers: { cpp: { cdbAutoDiscover: false } } }));
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      servers: { cpp: { cdbGlobs: ["out/**/compile_commands.json"] } },
+    }));
+
+    const config = await loadConfig(dir, globalPath);
+    const cpp = config.servers.find((s) => s.id === "cpp");
+    assert.equal(cpp?.cdbAutoDiscover, false, "flat fields must not silently re-enable discovery");
+    assert.deepEqual(cpp?.cdbGlobs, ["out/**/compile_commands.json"]);
+  });
+
+  it("clamps cdbMaxDepth and rejects malformed values", async () => {
+    const dir = await makeTempDir();
+    const globalPath = join(dir, "global.json");
+    await writeFile(globalPath, JSON.stringify({ servers: { cpp: { cdbMaxDepth: 99 } } }));
+    const clamped = await loadConfig(dir, globalPath);
+    assert.equal(clamped.servers.find((s) => s.id === "cpp")?.cdbMaxDepth, 8);
+
+    const badDir = await makeTempDir();
+    await writeFile(join(badDir, ".pi-lsp-lite.json"), JSON.stringify({
+      servers: { cpp: { cdbGlobs: [] } },
+    }));
+    const config = await loadConfig(badDir, join(badDir, "nonexistent-global.json"));
+    const cpp = config.servers.find((s) => s.id === "cpp");
+    assert.equal(cpp?.cdbGlobs, undefined, "an invalid override must not be applied");
+    assert.equal(cpp?.cdbAutoDiscover, true);
+  });
+});
+
 describe("writeGlobalConfig", () => {
   it("creates a new config file when none exists", async () => {
     const dir = await makeTempDir();
