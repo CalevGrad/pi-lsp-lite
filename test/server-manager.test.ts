@@ -2,9 +2,9 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createServerManager } from "../src/server-manager.js";
 import type { LanguageServerConfig } from "../src/languages.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { writeFile, mkdir, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -107,6 +107,43 @@ describe("ServerManager", () => {
     assert.equal(status.length, 1);
 
     await manager.shutdownAll();
+  });
+
+  it("diagnosticSummary counts errors and warnings over live servers and empties after shutdown", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const warnFile = join(dir, "warn.go");
+    const plainFile = join(dir, "plain.go");
+    await writeFile(warnFile, "package main");
+    await writeFile(plainFile, "package main");
+    const warnUri = pathToFileURL(await realpath(warnFile)).href;
+
+    const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } };
+    const config: LanguageServerConfig = {
+      ...fakeConfig,
+      args: [
+        fakeServerPath,
+        "--run",
+        `--options=${JSON.stringify({
+          diagnosticsByUri: {
+            [warnUri]: [
+              { range, severity: 1, message: "one error" },
+              { range, severity: 2, message: "one warning" },
+            ],
+          },
+        })}`,
+      ],
+    };
+
+    await manager.handleEdit(await realpath(warnFile), config, dir);
+    // plain.go gets the fake server's default single error
+    await manager.handleEdit(plainFile, config, dir);
+
+    assert.deepEqual(manager.diagnosticSummary(), { errors: 2, warnings: 1, files: 2 });
+
+    await manager.shutdownAll();
+    assert.deepEqual(manager.diagnosticSummary(), { errors: 0, warnings: 0, files: 0 });
   });
 
   it("missing binary disables language permanently", async () => {

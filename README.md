@@ -27,17 +27,33 @@ That's it. If you have `gopls`, `rust-analyzer`, `typescript-language-server`, `
   ⚠ LSP diagnostics for src/main.go (2 errors):
     error 12:5 [compiler] undefined: foo
     error 18:2 [compiler] too many arguments in call to bar
-    + 1 diagnostic in 1 other file
+    src/util.go (1 error): error 7:3 [compiler] undefined: parseConfig
 ```
 
 The agent sees these too — they're appended to the tool result, so it can self-correct on the same turn.
+
+Pi's footer carries the running total while you work:
+
+```
+LSP: 2 errors, 1 warning, in 3 files  errors red, warnings yellow
+LSP: ✓ clean                          green, nothing left in the analyzed files
+LSP: ⚠ incomplete                     the server timed out, the count may be low
+LSP: ✗ server unavailable             the binary is missing or failed to start
+```
+
+The `LSP:` label itself takes the color of the worst severity: red while any error stands, yellow when
+only warnings are left.
+
+The count covers the files the servers analyzed in this session — the ones you edited — not the whole
+project. Nothing appears before the first edit, so the footer never calls code clean that it has not
+looked at; after that it keeps the last measurement it made.
 
 ## Commands
 
 | Command | What it does |
 |---------|-------------|
 | `/lsp-status` | Show running servers, PIDs, workspace roots, uptime, and the argv they run with |
-| `/lsp-diag` | Show all current diagnostics (or `/lsp-diag path/to/file` for one file) |
+| `/lsp-log` | Show the extension log — config problems, spawned servers, server stderr (`/lsp-log cpp` to filter, `/lsp-log clear` to empty) |
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |
@@ -108,7 +124,8 @@ rule clangd uses. Nothing is searched at all when you have pinned a directory
 yourself, or when clangd can already find a database.
 
 If it finds several databases and cannot tell which one describes the file you are
-editing, it takes the newest and says so on stderr; pin the choice in that case:
+editing, it takes the newest and records that choice in the log, which `/lsp-log`
+shows; pin the choice in that case:
 
 ```json
 // <project>/.pi-lsp-lite.json
@@ -124,7 +141,7 @@ Notes:
 - Generate the database with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, `ninja -t compdb > compile_commands.json`, or `bear -- <build command>`.
 - Nothing is touched when clangd can already find a database, or when `.clangd` pins one with `CompileFlags.CompilationDatabase` — pointing clangd at one directory switches off its own search.
 - Set `"cdbAutoDiscover": false` to switch this off entirely.
-- `/lsp-status` shows the directory in effect. A database that appears mid-session is picked up automatically; `/lsp-restart cpp` forces it immediately.
+- `/lsp-status` prints the `--compile-commands-dir=…` the running clangd was spawned with. A database that appears mid-session is picked up automatically; `/lsp-restart cpp` forces it immediately.
 
 ## How it works
 
@@ -133,9 +150,15 @@ Notes:
 3. Spawns (or reuses) an LSP server for that language + root
 4. Sends `didChange`, waits for `publishDiagnostics`
 5. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
-6. Filters to errors + warnings, formats, appends to tool result + shows in TUI
+6. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
-Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, you see "+ N diagnostics in M other files".
+Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
+that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`.
+
+The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
+for other files, errors first, one line per diagnostic — long clangd template errors fold into one line.
+The summary above them still counts everything, so `137 errors` and `... and 117 more diagnostics in this
+file` appear in the same report.
 
 Servers are lazy (spawn on first edit), idle-shutdown after 240s, and clean up on session end.
 

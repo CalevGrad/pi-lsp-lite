@@ -373,12 +373,6 @@ export async function discoverCandidates(
  * safe signal; otherwise the newest database wins, which may inject the wrong
  * include paths and defines — callers are expected to warn about that.
  */
-/**
- * Picks the database to hand clangd. A single candidate needs no justification.
- * With several, "the edited file is listed in exactly one of them" is the only
- * safe signal; otherwise the newest database wins, which may inject the wrong
- * include paths and defines — callers are expected to warn about that.
- */
 export function pickCandidate(candidates: CdbCandidate[]): { chosen: CdbCandidate | null; reason: CdbReason } {
   if (candidates.length === 0) return { chosen: null, reason: "not-found" };
   if (candidates.length === 1) return { chosen: candidates[0], reason: "single" };

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type LanguageServerConfig, builtinLanguages } from "./languages.js";
 import { DEFAULT_CDB_MAX_DEPTH } from "./compile-commands.js";
+import { errText, log } from "./log.js";
 
 export interface ServerConfigOverride {
   extensions?: string[];
@@ -69,7 +70,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.extensions !== undefined) {
     if (!isStringArray(raw.extensions) || raw.extensions.length === 0) {
-      console.error(`[pi-lsp-lite] config "${id}": extensions must be a non-empty string array, skipping`);
+      log.warning(`config "${id}"`, "extensions must be a non-empty string array, skipping");
       return null;
     }
     override.extensions = raw.extensions.map((e) => e.toLowerCase());
@@ -77,7 +78,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.command !== undefined) {
     if (typeof raw.command !== "string" || raw.command.length === 0) {
-      console.error(`[pi-lsp-lite] config "${id}": command must be a non-empty string, skipping`);
+      log.warning(`config "${id}"`, "command must be a non-empty string, skipping");
       return null;
     }
     override.command = raw.command;
@@ -85,7 +86,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.args !== undefined) {
     if (!isStringArray(raw.args)) {
-      console.error(`[pi-lsp-lite] config "${id}": args must be a string array, skipping`);
+      log.warning(`config "${id}"`, "args must be a string array, skipping");
       return null;
     }
     override.args = raw.args;
@@ -93,7 +94,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.rootPatterns !== undefined) {
     if (!isStringArray(raw.rootPatterns)) {
-      console.error(`[pi-lsp-lite] config "${id}": rootPatterns must be a string array, skipping`);
+      log.warning(`config "${id}"`, "rootPatterns must be a string array, skipping");
       return null;
     }
     override.rootPatterns = raw.rootPatterns;
@@ -119,7 +120,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.cdbAutoDiscover !== undefined) {
     if (typeof raw.cdbAutoDiscover !== "boolean") {
-      console.error(`[pi-lsp-lite] config "${id}": cdbAutoDiscover must be a boolean, skipping`);
+      log.warning(`config "${id}"`, "cdbAutoDiscover must be a boolean, skipping");
       return null;
     }
     override.cdbAutoDiscover = raw.cdbAutoDiscover;
@@ -127,7 +128,7 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
 
   if (raw.cdbGlobs !== undefined) {
     if (!isStringArray(raw.cdbGlobs) || raw.cdbGlobs.length === 0) {
-      console.error(`[pi-lsp-lite] config "${id}": cdbGlobs must be a non-empty string array, skipping`);
+      log.warning(`config "${id}"`, "cdbGlobs must be a non-empty string array, skipping");
       return null;
     }
     override.cdbGlobs = raw.cdbGlobs;
@@ -151,19 +152,19 @@ async function readConfigFile(path: string): Promise<UserConfig | null> {
     content = await readFile(path, "utf-8");
   } catch (err: unknown) {
     if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return null;
-    console.error(`[pi-lsp-lite] failed to read config ${path}:`, err);
+    log.error("config", `failed to read config ${path}: ${errText(err)}`);
     return null;
   }
 
   try {
     const parsed: unknown = JSON.parse(content);
     if (!isPlainObject(parsed)) {
-      console.error(`[pi-lsp-lite] config ${path}: expected a JSON object, skipping`);
+      log.warning("config", `config ${path}: expected a JSON object, skipping`);
       return null;
     }
     return parsed as UserConfig;
   } catch (err) {
-    console.error(`[pi-lsp-lite] config ${path}: invalid JSON, skipping:`, err);
+    log.error("config", `config ${path}: invalid JSON, skipping: ${errText(err)}`);
     return null;
   }
 }
@@ -217,7 +218,7 @@ function mergeConfigs(
       if (source === "project") {
         for (const field of ["command", "args", "extensions", "rootPatterns"] as const) {
           if (lspFields[field] !== undefined) {
-            console.error(`[pi-lsp-lite] project config cannot override "${field}" for server "${id}" — ignoring (use global config instead)`);
+            log.warning(`config "${id}"`, `project config cannot override "${field}" — ignoring (use global config instead)`);
             delete lspFields[field];
           }
         }
@@ -228,11 +229,11 @@ function mergeConfigs(
       result.set(id, { ...existing, ...defined });
     } else {
       if (source === "project") {
-        console.error(`[pi-lsp-lite] project config cannot define new server "${id}" — only global config (~/.pi-lsp-lite.json) can add servers`);
+        log.warning(`config "${id}"`, "project config cannot define a new server — only global config (~/.pi-lsp-lite.json) can add servers");
         continue;
       }
       if (!override.command || !override.extensions) {
-        console.error(`[pi-lsp-lite] config "${id}" must have at least "command" and "extensions" to define a new server, skipping`);
+        log.warning(`config "${id}"`, `must have at least "command" and "extensions" to define a new server, skipping`);
         continue;
       }
       result.set(id, {

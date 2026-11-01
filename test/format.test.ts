@@ -186,7 +186,7 @@ describe("formatDiagnostics", () => {
     assert.ok(output.includes("server missing or failed to start"), `expected reason in: ${output}`);
   });
 
-  it("truncates diagnostics beyond cap with a note", () => {
+  it("truncates diagnostics beyond the line budget with a note", () => {
     const diags = Array.from({ length: 60 }, (_, i) =>
       makeDiag(DiagnosticSeverity.Error, `error ${i}`, i),
     );
@@ -199,9 +199,103 @@ describe("formatDiagnostics", () => {
 
     const output = formatDiagnostics("main.go", result);
     assert.ok(output.includes("60 errors"), `expected full count in summary: ${output}`);
-    assert.ok(output.includes("... and 10 more"), `expected truncation note: ${output}`);
+    assert.ok(output.includes("... and 40 more diagnostics in this file"), `expected truncation note: ${output}`);
     const errorLines = output.split("\n").filter((l) => l.trimStart().startsWith("error"));
-    assert.equal(errorLines.length, 50, "should show at most 50 diagnostic lines");
+    assert.equal(errorLines.length, 20, "should show at most 20 diagnostic lines");
+  });
+
+  it("lists errors before warnings regardless of publication order", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [
+        makeDiag(DiagnosticSeverity.Warning, "unused var", 9),
+        makeDiag(DiagnosticSeverity.Error, "undefined symbol", 2),
+        makeDiag(DiagnosticSeverity.Warning, "sign compare", 4),
+      ],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => l.startsWith("  "));
+    assert.deepEqual(lines.map((l) => l.trim().split(" ")[0]), ["error", "warning", "warning"]);
+  });
+
+  it("keeps position order inside one severity", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [
+        makeDiag(DiagnosticSeverity.Error, "late", 40),
+        makeDiag(DiagnosticSeverity.Error, "early", 3),
+      ],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.indexOf("early") < output.indexOf("late"), `expected line 4 before line 41: ${output}`);
+  });
+
+  it("folds a multi-line clangd message into one report line", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "no matching function\ncandidate ignored\ntype erased here", 1)],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.cpp", result);
+    assert.equal(output.split("\n").length, 3, `blank + header + one diagnostic line: ${output}`);
+    assert.ok(output.includes("no matching function candidate ignored type erased here"), output);
+  });
+
+  it("cuts a long message with an ellipsis", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "x".repeat(500))],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const line = formatDiagnostics("main.cpp", result).split("\n")[2];
+    assert.ok(line.endsWith("…"), line);
+    assert.ok(line.length <= "  error 1:1 [test] ".length + 200);
+  });
+
+  it("caps the other-files block and reports what it hid", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "broken include", 0)],
+      otherFiles: Array.from({ length: 25 }, (_, i) => ({
+        uri: `file:///project/inc/header${String(i).padStart(2, "0")}.h`,
+        errorCount: 1,
+        warningCount: 0,
+      })),
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.cpp", result);
+    assert.ok(output.includes("... and 15 more files with diagnostics"), output);
+    const fileLines = output.split("\n").filter((l) => l.includes("/project/inc/"));
+    assert.equal(fileLines.length, 10, `expected 10 other-file lines in:\n${output}`);
+  });
+
+  it("lists the worst other files first", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "broken include", 0)],
+      otherFiles: [
+        { uri: "file:///project/mild.h", errorCount: 1, warningCount: 0 },
+        { uri: "file:///project/severe.h", errorCount: 9, warningCount: 0 },
+        { uri: "file:///project/warnings.h", errorCount: 0, warningCount: 4 },
+      ],
+      retryAttempts: 0,
+    };
+
+    const order = formatDiagnostics("main.cpp", result)
+      .split("\n")
+      .filter((l) => l.includes("/project/"))
+      .map((l) => l.trim().split(" ")[0]);
+    assert.deepEqual(order, ["/project/severe.h", "/project/mild.h", "/project/warnings.h"]);
   });
 });
 
