@@ -54,7 +54,8 @@ function countDiagnostics(diags: Diagnostic[]): { errors: number; warnings: numb
   return { errors, warnings };
 }
 
-function diagnosticMessage(d: Diagnostic): string {
+/** LSP allows a plain string or markup for a diagnostic message. */
+export function diagnosticMessage(d: Diagnostic): string {
   return typeof d.message === "string" ? d.message : d.message.value;
 }
 

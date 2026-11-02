@@ -15,7 +15,9 @@ src/
   install-registry.ts  → known install commands for built-in servers
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
-  format.ts            → diagnostic formatting for agent consumption
+  format.ts            → diagnostic formatting and the report line budget
+  footer.ts            → one-line footer status (counts, clean, degraded states)
+  log.ts               → in-memory diagnostic log, shown by /lsp-log
   util.ts              → file URI, binary lookup, workspace root detection
 test/
   fake-server.ts       → minimal LSP server for unit tests
@@ -32,7 +34,8 @@ agent calls write/edit
   → index.ts: check file extension, resolve absolute path, enforce cwd boundary
   → server-manager.ts: find workspace root, ensure server, queue edit
   → client.ts: send didOpen/didChange, wait for publishDiagnostics
-  → format.ts: filter to errors+warnings, format text, add cross-file footer
+  → format.ts: filter to errors+warnings, sort errors first, keep the line budget, add cross-file footer
+  → server-manager.diagnosticSummary(): totals over live servers → footer.ts → ctx.ui.setStatus("lsp", ...)
   → index.ts: append formatted text to tool_result content
 ```
 
@@ -80,6 +83,15 @@ handleEdit(lib.ts):
   │
   └─ result: { status:"ok", diagnostics:[], otherFiles:[{caller.ts, errors:1}] }
 ```
+
+### Report budget
+
+The report goes into the tool result, so it competes with the agent's own context. `format.ts` caps it at
+`MAX_TARGET_LINES = 20` lines for the edited file and `MAX_OTHER_FILE_LINES = 10` for other files, one
+line per diagnostic: messages fold to a single line and are cut at `MAX_MESSAGE_LENGTH = 200`.
+Diagnostics are sorted error-first, then by position, because truncation keeps the leading lines and a
+clang-tidy cascade must not push out the one compiler error. Counts in the summary line always cover the
+full set, so a truncated report still says how bad it is.
 
 ### Per-language diagnostic timeouts
 
@@ -147,8 +159,8 @@ then by path, so behaviour stays reproducible.
    the server has none and one turns up. A rival database is reported once and
    left alone.
 
-The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn and
-shown by `/lsp-status`. Lookups are cached per server + root + cwd + file for
+The chosen directory is passed as `--compile-commands-dir=<dir>` at spawn, and `/lsp-status` prints the
+argv of each running server, that flag included. Lookups are cached per server + root + cwd + file for
 30 s, the interval clangd itself uses to re-probe a missing database. Only the directory
 needs a new process; content changes are clangd's own business — it re-reads the
 file every 5 s. Restarts are throttled to one per 10 s per workspace so a
@@ -157,14 +169,14 @@ drops the cache and the notices, so the next edit re-reads everything.
 
 ### Workspace root detection
 
-`findWorkspaceRoot()` walks up from the edited file looking for root markers (`go.mod`, `Cargo.toml`, `tsconfig.json`, `package.json`), bounded by the session's `cwd`. Different roots spawn different server instances, keyed by `${languageId}:${root}`.
+`findWorkspaceRoot()` walks up from the edited file looking for root markers (`go.mod`; `Cargo.toml`; `tsconfig.json`, `package.json`; `pyproject.toml`, `setup.py`, `requirements.txt`; `compile_commands.json`, `CMakeLists.txt`, `.clangd`), bounded by the session's `cwd`. Different roots spawn different server instances, keyed by `${config.id}:${root}`.
 
 ### Server lifecycle
 
 - Lazy start on first relevant edit
 - Idle shutdown after 240s of no edits
 - Periodic 60s sweep closes documents idle > 120s
-- Session shutdown uses SIGTERM → SIGKILL escalation with 5s grace
+- Session shutdown sends the LSP `shutdown` request (5 s cap), then escalates SIGTERM → SIGKILL with a 2 s grace
 
 ### Failure isolation
 
@@ -198,7 +210,8 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 | `tool_result` | Intercept write/edit results, append diagnostics |
 | `session_start` | Load config, create server manager |
 | `session_shutdown` | Kill all servers |
-| `registerCommand` | `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| `registerCommand` | `/lsp-status`, `/lsp-log`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| `setStatus` | one-line footer total: errors, warnings, clean, timeout, unavailable |
 
 ## Adding a language
 
