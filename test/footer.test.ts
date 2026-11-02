@@ -6,7 +6,7 @@ import { formatFooterStatus, type FooterState, type FooterTheme } from "../src/f
 const theme: FooterTheme = { fg: (color, text) => `[${color}]${text}` };
 
 function state(overrides: Partial<FooterState>): FooterState {
-  return { errors: 0, warnings: 0, files: 0, checked: 0, health: "unknown", ...overrides };
+  return { errors: 0, warnings: 0, files: 0, checked: 0, health: "unknown", unavailable: [], ...overrides };
 }
 
 describe("formatFooterStatus", () => {
@@ -15,8 +15,13 @@ describe("formatFooterStatus", () => {
   });
 
   it("reports an unavailable server even with nothing analyzed", () => {
-    const text = formatFooterStatus(state({ checked: 0, health: "unavailable" }), theme);
-    assert.equal(text, "[error]LSP: [error]server unavailable");
+    const text = formatFooterStatus(state({ checked: 0, unavailable: ["typescript"] }), theme);
+    assert.equal(text, "[error]LSP: [error]1 server unavailable");
+  });
+
+  it("counts dead servers without naming them", () => {
+    const text = formatFooterStatus(state({ checked: 0, unavailable: ["go", "python", "typescript"] }), theme);
+    assert.equal(text, "[error]LSP: [error]3 servers unavailable");
   });
 
   it("says clean in plain text when a live server found nothing", () => {
@@ -60,5 +65,35 @@ describe("formatFooterStatus", () => {
       theme,
     );
     assert.equal(text, "[error]LSP: [error]2 errors, [warning]1 warning [muted]in 3 files [error]· timeout");
+  });
+
+  // A live server's counts are the reason this row exists; a dead one may not hide them.
+  it("keeps a live server's counts when another one is dead", () => {
+    const text = formatFooterStatus(
+      state({ errors: 3, warnings: 1, files: 2, checked: 3, health: "ok", unavailable: ["typescript"] }),
+      theme,
+    );
+    assert.equal(text, "[error]LSP: [error]3 errors, [warning]1 warning [muted]in 2 files [error]· 1 server unavailable");
+  });
+
+  it("does not call a session clean while a server is dead", () => {
+    const text = formatFooterStatus(state({ checked: 2, health: "ok", unavailable: ["python"] }), theme);
+    assert.equal(text, "LSP: clean [error]· 1 server unavailable");
+  });
+
+  it("keeps the timeout note when a server is dead too", () => {
+    const text = formatFooterStatus(
+      state({ errors: 2, files: 1, checked: 2, health: "timeout", unavailable: ["typescript"] }),
+      theme,
+    );
+    assert.equal(text, "[error]LSP: [error]2 errors [error]· timeout [error]· 1 server unavailable");
+  });
+
+  it("marks incomplete counts red even with a dead server noted", () => {
+    const text = formatFooterStatus(
+      state({ checked: 2, health: "timeout", unavailable: ["go", "python"] }),
+      theme,
+    );
+    assert.equal(text, "[error]LSP: [error]incomplete [error]· 2 servers unavailable");
   });
 });

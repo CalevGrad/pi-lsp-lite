@@ -35,7 +35,7 @@ agent calls write/edit
   → server-manager.ts: find workspace root, ensure server, queue edit
   → client.ts: send didOpen/didChange, wait for publishDiagnostics
   → format.ts: filter to errors+warnings, sort errors first, keep the line budget, add cross-file footer
-  → server-manager.diagnosticSummary(): totals over live servers → footer.ts → ctx.ui.setStatus("lsp", ...)
+  → server-manager.diagnosticSummary(): totals over live servers, plus the ids of dead ones → footer.ts → ctx.ui.setStatus("lsp", ...)
   → index.ts: append formatted text to tool_result content
 ```
 
@@ -180,9 +180,10 @@ drops the cache and the notices, so the next edit re-reads everything.
 
 ### Failure isolation
 
-- Missing binary: disables that language for the session
+- Missing binary: disables that language for the session. `/lsp-restart` clears the blacklist, because a binary installed by hand is the filesystem changing and a restart means re-reading it
 - Init failure: disables only that specific root (serverKey), other roots unaffected
-- Both return `status: "unavailable"` so the agent isn't told the file is clean when it's actually unchecked
+- Both return `status: "unavailable"` for that edit and put the id in `diagnosticSummary().unavailable`. The footer turns that into a red dead-server count, and never lets it replace the counts of a server that is alive — a dead TypeScript server used to hide live clangd totals behind `LSP: server unavailable`
+- The agent gets no report for such a file: it can neither install the binary nor revive a crashed server, and a notice would repeat on every edit. The tradeoff is deliberate — an unchecked file then reads to the agent as an unremarkable one, and only the footer says otherwise. `/lsp-status` names the dead server, `/lsp-log` records why
 
 ## Configuration loading
 
@@ -211,7 +212,7 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 | `session_start` | Load config, create server manager |
 | `session_shutdown` | Kill all servers |
 | `registerCommand` | `/lsp-status`, `/lsp-log`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
-| `setStatus` | one-line footer total: errors, warnings, clean, timeout, unavailable |
+| `setStatus` | one-line footer total: errors, warnings, clean, timeout, dead-server count |
 
 ## Adding a language
 

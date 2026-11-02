@@ -39,19 +39,30 @@ LSP: 2 errors, 1 warning in 3 files    errors red, warnings yellow
 LSP: 2 errors · timeout                red tail, the counts are a lower bound
 LSP: clean                             no color, nothing left in the analyzed files
 LSP: incomplete                        red, the server timed out, the count may be low
-LSP: server unavailable                red, the binary is missing or failed to start
+LSP: 1 server unavailable              red, a server you edited for is missing or failed to start
+LSP: 3 errors, 1 warning in 2 files · 1 server unavailable    counts stay, the dead one is noted
 ```
 
 The `LSP:` label itself takes the color of the worst severity: red while any error stands, yellow when
-only warnings are left. `incomplete` and `server unavailable` color the whole line red — the number is
+only warnings are left. `incomplete` and a dead-server count color the whole line red — the number is
 unreliable there, so it gets the same attention as an error. `clean` stays plain: nothing to look at.
 When a check times out but issues were found, the same red `· timeout` tail marks the counts as a lower
 bound. It sits after the list, not inside it, because it is a remark about the numbers rather than
 another number.
 
+A server that is down gets that same treatment: it joins the notes after the counts instead of replacing
+them, so a dead `typescript-language-server` never hides what clangd found. It is counted, not named —
+`/lsp-status` says which server, `/lsp-log` says why — because the row has no room for a list of ids.
+Alone, with nothing analyzed yet, it is the whole line.
+
 The count covers the files the servers analyzed in this session — the ones you edited — not the whole
 project. Nothing appears before the first edit, so the footer never calls code clean that it has not
 looked at; after that it keeps the last measurement it made.
+
+A server that is missing or fails to start is the one thing the agent never hears about. A binary it
+cannot install and a server it cannot revive are not things it can act on, so that file gets no report at
+all and the footer carries the news alone. `/lsp-status` names the dead server, `/lsp-log` records why,
+`/lsp-install` fixes what it can.
 
 ## Commands
 
@@ -62,7 +73,7 @@ looked at; after that it keeps the last measurement it made.
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |
-| `/lsp-restart` | Restart a running server (`/lsp-restart cpp`) so it re-reads config and compile commands |
+| `/lsp-restart` | Restart a running server (`/lsp-restart cpp`) so it re-reads config, PATH, and compile commands |
 | `/lsp-install` | Install a missing server binary |
 
 ## Supported servers

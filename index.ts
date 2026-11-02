@@ -80,7 +80,10 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
-      health = result.status;
+      // "unavailable" is not a measurement, only the news that this edit found no server to
+      // measure with. The summary carries dead servers, so health keeps the state of the last
+      // check that actually ran rather than getting wiped by an edit that ran no check.
+      if (result.status !== "unavailable") health = result.status;
       updateFooter(ctx);
       const formatted = formatDiagnostics(filePath, result, ctx.cwd);
       if (!formatted) return;
@@ -117,7 +120,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(
-        `pi-lsp-lite: stopped ${stopped} server${stopped !== 1 ? "s" : ""} — the next edit respawns them with current config and compile commands`,
+        `pi-lsp-lite: stopped ${stopped} server${stopped !== 1 ? "s" : ""} — the next edit respawns them with current config, PATH, and compile commands`,
         "info",
       );
     },

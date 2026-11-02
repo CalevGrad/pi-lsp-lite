@@ -44,15 +44,18 @@ function displayPath(uri: string, cwd?: string): string {
 }
 
 export function formatDiagnostics(filePath: string, result: DiagnosticResult, cwd?: string): string {
+  // An unavailable server is the human's problem: a missing binary or a failed initialize. The
+  // footer shows it in red and the agent's tool result stays untouched. Don't add a notice back
+  // here — the agent can neither install a binary nor revive a crashed server, and it would
+  // repeat on every edit of that language. The accepted cost is that an unchecked file now reads
+  // to the agent as an unremarkable one.
+  if (result.status === "unavailable") return "";
+
   const allRelevant = result.diagnostics.filter(
     (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
   );
 
   if (allRelevant.length === 0 && result.status === "ok" && result.otherFiles.length === 0) return "";
-
-  if (result.status === "unavailable") {
-    return `\n⚠ LSP diagnostics unavailable for ${filePath} (server missing or failed to start)`;
-  }
 
   const sorted = [...allRelevant].sort(bySeverityThenPosition);
   const relevant = sorted.slice(0, MAX_TARGET_LINES);

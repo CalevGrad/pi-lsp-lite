@@ -1,7 +1,8 @@
 import type { DiagnosticSummary } from "./server-manager.js";
 
-/** What the language servers last told us; "unknown" until the first edit of the session. */
-export type LspHealth = "ok" | "timeout" | "unavailable" | "unknown";
+/** What the language servers last measured; "unknown" until the first edit of the session.
+ *  An unusable server is not a measurement, so it is not here — it rides in `unavailable`. */
+export type LspHealth = "ok" | "timeout" | "unknown";
 
 /** The subset of Pi's theme the footer needs. */
 export type FooterColor = "error" | "warning" | "muted";
@@ -29,10 +30,15 @@ function count(n: number, noun: string): string {
 export function formatFooterStatus(state: FooterState, theme: FooterTheme): string | undefined {
   const label = (color: FooterColor) => theme.fg(color, "LSP:");
 
-  if (state.health === "unavailable") {
-    return `${label("error")} ${theme.fg("error", "server unavailable")}`;
+  // Servers an edit reached but could not use. Counted, never named: `/lsp-status` says which one
+  // and `/lsp-log` says why, while the footer row has no room for a list of ids.
+  const dead = state.unavailable.length === 0 ? "" : `${count(state.unavailable.length, "server")} unavailable`;
+
+  if (state.checked === 0) {
+    // Nothing was analyzed: no measurement to show, and dead servers are the only news there is.
+    if (dead === "") return undefined;
+    return `${label("error")} ${theme.fg("error", dead)}`;
   }
-  if (state.checked === 0) return undefined;
 
   // The label carries the worst severity, so the state is readable at a glance.
   // Only reached with at least one issue, hence no muted case here.
@@ -44,17 +50,21 @@ export function formatFooterStatus(state: FooterState, theme: FooterTheme): stri
 
   if (parts.length === 0) {
     // A timeout with nothing reported proves nothing, so it must not read as clean.
-    if (state.health === "timeout") return `${label("error")} ${theme.fg("error", "incomplete")}`;
-    // Clean gets no color at all: it is the absence of news, not news worth highlighting.
-    return `LSP: clean`;
+    const measured = state.health === "timeout"
+      ? `${label("error")} ${theme.fg("error", "incomplete")}`
+      : `LSP: clean`;
+    // Dead servers never join "clean": the files they hold are unchecked, not fine.
+    return dead === "" ? measured : `${measured} ${theme.fg("error", `· ${dead}`)}`;
   }
 
   // Numbers take the comma list; the notes after them take spaces. "in 3 files" and a timeout
   // remark are both remarks about the numbers, so neither may join the list. "· timeout" shares
-  // "incomplete"'s red: it makes the counts a floor, not a total.
+  // "incomplete"'s red: it makes the counts a floor, not a total. A dead server gets the same red
+  // for the same reason — it bounds what the numbers cover.
   const notes: string[] = [];
   if (state.files > 1) notes.push(theme.fg("muted", `in ${state.files} files`));
   if (state.health === "timeout") notes.push(theme.fg("error", "· timeout"));
+  if (dead !== "") notes.push(theme.fg("error", `· ${dead}`));
 
   const tail = notes.length ? ` ${notes.join(" ")}` : "";
   return `${label(labelColor)} ${parts.join(", ")}${tail}`;

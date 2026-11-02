@@ -172,7 +172,7 @@ describe("formatDiagnostics", () => {
     assert.ok(output.includes("after 1 retry"), `expected 'after 1 retry' in: ${output}`);
   });
 
-  it("surfaces unavailable status instead of returning empty", () => {
+  it("keeps an unavailable server out of the agent report", () => {
     const result: DiagnosticResult = {
       status: "unavailable",
       diagnostics: [],
@@ -180,10 +180,9 @@ describe("formatDiagnostics", () => {
       retryAttempts: 0,
     };
 
-    const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("unavailable"), `expected 'unavailable' in: ${output}`);
-    assert.ok(output.includes("main.go"), `expected file path in: ${output}`);
-    assert.ok(output.includes("server missing or failed to start"), `expected reason in: ${output}`);
+    // The footer carries this state; a report would only tell the agent about a server it
+    // cannot install or restart, on every edit.
+    assert.equal(formatDiagnostics("main.go", result), "");
   });
 
   it("truncates diagnostics beyond the line budget with a note", () => {

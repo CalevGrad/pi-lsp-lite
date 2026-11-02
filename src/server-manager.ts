@@ -52,6 +52,12 @@ export interface DiagnosticSummary {
   warnings: number;
   /** Files holding at least one error or warning. */
   files: number;
+  /**
+   * Ids of servers an edit reached but could not use: no binary on PATH, or `initialize` failed
+   * for that root. Only languages that were actually edited appear — the footer must not
+   * announce a dead server for a language nobody touched this session.
+   */
+  unavailable: string[];
 }
 
 export interface ServerStatus {
@@ -478,7 +484,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
           warnings += fileWarnings;
         }
       }
-      return { errors, warnings, files };
+      const dead = new Set(disabledBinaries);
+      for (const key of failedRoots) dead.add(key.slice(0, key.indexOf(":")));
+
+      return { errors, warnings, files, unavailable: [...dead].sort() };
     },
 
     async restart(id?: string): Promise<number> {
@@ -495,6 +504,12 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       }
       for (const key of [...failedRoots]) {
         if (!id || key.startsWith(id + ":")) failedRoots.delete(key);
+      }
+      // A binary installed by hand since the last attempt is also the filesystem changing, so
+      // the PATH blacklist goes the same way. Keeping it would hold the footer on "server
+      // unavailable" for a server that is now healthy.
+      for (const key of [...disabledBinaries]) {
+        if (!id || key === id) disabledBinaries.delete(key);
       }
 
       await Promise.allSettled(targets.map((s) => shutdownServer(s)));

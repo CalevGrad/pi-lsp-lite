@@ -140,10 +140,10 @@ describe("ServerManager", () => {
     // plain.go gets the fake server's default single error
     await manager.handleEdit(plainFile, config, dir);
 
-    assert.deepEqual(manager.diagnosticSummary(), { errors: 2, warnings: 1, files: 2 });
+    assert.deepEqual(manager.diagnosticSummary(), { errors: 2, warnings: 1, files: 2, unavailable: [] });
 
     await manager.shutdownAll();
-    assert.deepEqual(manager.diagnosticSummary(), { errors: 0, warnings: 0, files: 0 });
+    assert.deepEqual(manager.diagnosticSummary(), { errors: 0, warnings: 0, files: 0, unavailable: [] });
   });
 
   it("missing binary disables language permanently", async () => {
@@ -161,6 +161,8 @@ describe("ServerManager", () => {
     assert.equal(result2.diagnostics.length, 0);
 
     assert.equal(manager.status().length, 0);
+    // The footer counts dead servers from the summary, so the disabled id must be in it.
+    assert.deepEqual(manager.diagnosticSummary().unavailable, ["missing"]);
 
     await manager.shutdownAll();
   });
@@ -223,6 +225,9 @@ describe("ServerManager", () => {
     const resultB = await manager.handleEdit(fileB, fakeConfig, dir);
     assert.equal(resultB.status, "ok");
     assert.ok(resultB.diagnostics.length > 0, "root B should produce diagnostics");
+
+    // One dead root out of two: counted once, not once per failed root key.
+    assert.deepEqual(manager.diagnosticSummary().unavailable, ["fake-crash"]);
 
     await manager.shutdownAll();
   });
@@ -679,6 +684,23 @@ describe("ServerManager.restart", () => {
     const manager = createServerManager();
     assert.equal(await manager.restart("never-started"), 0);
     assert.equal(await manager.restart(), 0);
+    await manager.shutdownAll();
+  });
+
+  // A binary installed by hand mid-session is only usable if the PATH blacklist dies with the
+  // restart; otherwise the footer holds "server unavailable" over a healthy server.
+  it("clears a server disabled by a missing binary", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    const filePath = join(dir, "main.xyz");
+    await writeFile(filePath, "content");
+
+    assert.equal((await manager.handleEdit(filePath, missingConfig, dir)).status, "unavailable");
+    assert.deepEqual(manager.diagnosticSummary().unavailable, ["missing"]);
+
+    await manager.restart("missing");
+    assert.deepEqual(manager.diagnosticSummary().unavailable, []);
+
     await manager.shutdownAll();
   });
 
