@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isEditToolResult, isWriteToolResult } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostics } from "./src/format.js";
@@ -61,12 +62,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
+    // Narrow through pi's guards, not our own string comparison over event.toolName: pi names
+    // the tools, so a rename or a reworked result pipeline breaks `npm run check` here instead
+    // of leaving this hook silently matching nothing.
+    if (!isWriteToolResult(event) && !isEditToolResult(event)) return;
+    if (event.isError) return;
 
-    const rawPath = event.input?.path;
+    const rawPath = event.input.path;
     const filePath = typeof rawPath === "string" ? rawPath : undefined;
     if (!filePath) return;
-    if (event.isError) return;
 
     let absolutePath: string;
     try {

@@ -34,7 +34,7 @@
     "which": "^2.0.2"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
     "typebox": "*"
   },
   "devDependencies": {
