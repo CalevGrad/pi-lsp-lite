@@ -16,17 +16,17 @@ describe("formatFooterStatus", () => {
 
   it("reports an unavailable server even with nothing analyzed", () => {
     const text = formatFooterStatus(state({ checked: 0, health: "unavailable" }), theme);
-    assert.equal(text, "[muted]LSP: [error]✗ server unavailable");
+    assert.equal(text, "[error]LSP: [error]server unavailable");
   });
 
-  it("says clean when a live server found nothing", () => {
+  it("says clean in plain text when a live server found nothing", () => {
     const text = formatFooterStatus(state({ checked: 4, health: "ok" }), theme);
-    assert.equal(text, "[muted]LSP: [success]✓ clean");
+    assert.equal(text, "LSP: clean");
   });
 
   it("does not call a timed-out zero count clean", () => {
     const text = formatFooterStatus(state({ checked: 2, health: "timeout" }), theme);
-    assert.equal(text, "[muted]LSP: [warning]⚠ incomplete");
+    assert.equal(text, "[error]LSP: [error]incomplete");
   });
 
   it("colors the label with the error severity", () => {
@@ -41,7 +41,7 @@ describe("formatFooterStatus", () => {
 
   it("names the file count when issues span several files", () => {
     const text = formatFooterStatus(state({ errors: 2, warnings: 1, files: 3, checked: 6, health: "ok" }), theme);
-    assert.equal(text, "[error]LSP: [error]2 errors, [warning]1 warning, [muted]in 3 files");
+    assert.equal(text, "[error]LSP: [error]2 errors, [warning]1 warning [muted]in 3 files");
   });
 
   it("omits the file count when one file holds every issue", () => {
@@ -51,6 +51,14 @@ describe("formatFooterStatus", () => {
 
   it("appends the timeout note after the counts", () => {
     const text = formatFooterStatus(state({ errors: 1, files: 1, checked: 2, health: "timeout" }), theme);
-    assert.equal(text, "[error]LSP: [error]1 error, [warning]· timeout");
+    assert.equal(text, "[error]LSP: [error]1 error [error]· timeout");
+  });
+
+  it("keeps the timeout note out of the comma list", () => {
+    const text = formatFooterStatus(
+      state({ errors: 2, warnings: 1, files: 3, checked: 6, health: "timeout" }),
+      theme,
+    );
+    assert.equal(text, "[error]LSP: [error]2 errors, [warning]1 warning [muted]in 3 files [error]· timeout");
   });
 });

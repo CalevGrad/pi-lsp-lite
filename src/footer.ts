@@ -4,7 +4,7 @@ import type { DiagnosticSummary } from "./server-manager.js";
 export type LspHealth = "ok" | "timeout" | "unavailable" | "unknown";
 
 /** The subset of Pi's theme the footer needs. */
-export type FooterColor = "error" | "warning" | "success" | "muted";
+export type FooterColor = "error" | "warning" | "muted";
 
 export interface FooterTheme {
   fg(color: FooterColor, text: string): string;
@@ -30,12 +30,13 @@ export function formatFooterStatus(state: FooterState, theme: FooterTheme): stri
   const label = (color: FooterColor) => theme.fg(color, "LSP:");
 
   if (state.health === "unavailable") {
-    return `${label("muted")} ${theme.fg("error", "✗ server unavailable")}`;
+    return `${label("error")} ${theme.fg("error", "server unavailable")}`;
   }
   if (state.checked === 0) return undefined;
 
   // The label carries the worst severity, so the state is readable at a glance.
-  const labelColor: FooterColor = state.errors > 0 ? "error" : state.warnings > 0 ? "warning" : "muted";
+  // Only reached with at least one issue, hence no muted case here.
+  const labelColor: FooterColor = state.errors > 0 ? "error" : "warning";
 
   const parts: string[] = [];
   if (state.errors > 0) parts.push(theme.fg("error", count(state.errors, "error")));
@@ -43,12 +44,18 @@ export function formatFooterStatus(state: FooterState, theme: FooterTheme): stri
 
   if (parts.length === 0) {
     // A timeout with nothing reported proves nothing, so it must not read as clean.
-    if (state.health === "timeout") return `${label("muted")} ${theme.fg("warning", "⚠ incomplete")}`;
-    return `${label("muted")} ${theme.fg("success", "✓ clean")}`;
+    if (state.health === "timeout") return `${label("error")} ${theme.fg("error", "incomplete")}`;
+    // Clean gets no color at all: it is the absence of news, not news worth highlighting.
+    return `LSP: clean`;
   }
 
-  if (state.files > 1) parts.push(theme.fg("muted", `in ${state.files} files`));
-  if (state.health === "timeout") parts.push(theme.fg("warning", "· timeout"));
+  // Numbers take the comma list; the notes after them take spaces. "in 3 files" and a timeout
+  // remark are both remarks about the numbers, so neither may join the list. "· timeout" shares
+  // "incomplete"'s red: it makes the counts a floor, not a total.
+  const notes: string[] = [];
+  if (state.files > 1) notes.push(theme.fg("muted", `in ${state.files} files`));
+  if (state.health === "timeout") notes.push(theme.fg("error", "· timeout"));
 
-  return `${label(labelColor)} ${parts.join(", ")}`;
+  const tail = notes.length ? ` ${notes.join(" ")}` : "";
+  return `${label(labelColor)} ${parts.join(", ")}${tail}`;
 }
