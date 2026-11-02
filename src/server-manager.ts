@@ -1,4 +1,5 @@
 import { type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import spawn from "cross-spawn";
 import { which, fileUri, findWorkspaceRoot } from "./util.js";
 import { errText, log } from "./log.js";
@@ -19,14 +20,19 @@ import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-proto
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-interface OpenDocument {
-  lastActivity: number;
-  /**
-   * Disk stamp of the text the server currently holds. A mismatch with the disk means something
-   * outside the editor rewrote the file between our edits — `git checkout`, `sed -i`, a formatter.
-   */
+/** What the server was last given for a document, as recorded on disk. */
+interface DocumentStamp {
   mtimeMs: number;
   size: number;
+  /**
+   * Hash of the exact text sent to the server. mtime and size cannot answer "did the text change":
+   * a rewrite with identical content moves mtime and changes nothing else.
+   */
+  textHash: string;
+}
+
+interface OpenDocument extends DocumentStamp {
+  lastActivity: number;
 }
 
 interface ManagedServer {
@@ -48,16 +54,25 @@ interface ManagedServer {
   cdbFile: string | null;
 }
 
+/** Findings for one file, plus whether a live server still watches it. */
+export interface FileFindings {
+  diagnostics: Diagnostic[];
+  watched: boolean;
+}
+
 export interface ServerManager {
   handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult>;
   status(): ServerStatus[];
   /** Error and warning totals over every live server, for the footer. */
   diagnosticSummary(): DiagnosticSummary;
   /**
-   * Findings behind those totals: uri -> diagnostics, over every live server. The set shrinks when
-   * a document is closed, so this is "what we measure now", not "what we have ever seen".
+   * Findings behind those totals: uri -> diagnostics and whether the file is still watched. Kept
+   * when a document closes, because a file we stopped watching is not a clean file. Dropped when the
+   * file is deleted or its server dies.
    */
-  getAllDiagnostics(): Map<string, Diagnostic[]>;
+  getAllDiagnostics(): Map<string, FileFindings>;
+  /** Documents at least one answer arrived for, watched or not. Zero means nothing was measured. */
+  measuredDocuments(): number;
   /** Stops running servers (all, or only one id) so the next edit respawns them with current config. */
   restart(id?: string): Promise<number>;
   shutdownAll(): Promise<void>;
@@ -106,6 +121,16 @@ export interface ServerManagerOptions {
 }
 
 const RETRY_BASE_DELAY_MS = 500;
+/**
+ * How long to wait when the text did not change. The answer is already cached, so this only covers
+ * the quiescence window; no retries, because a server with nothing new to say stays silent.
+ */
+const UNCHANGED_TEXT_WAIT_MS = 1_000;
+
+/** Identity of a document's text. mtime and size cannot tell a rewrite from a no-op. */
+function hashText(text: string): string {
+  return createHash("sha1").update(text, "utf8").digest("base64");
+}
 const MAX_RETRY_DELAY_MS = 30_000;
 
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
@@ -436,33 +461,65 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
    * Stop trusting documents the disk changed under. Anything can rewrite a file between our
    * edits — `git checkout`, `sed -i`, a formatter run — and until the server hears about it it
    * keeps parsing the text we sent: line numbers drift, and diagnostics that no longer exist keep
-   * coming back. Closing is enough to fix that. clangd reads an included file from disk again when
-   * it parses a translation unit that needs it, and the next edit of that file opens it fresh.
+   * coming back. The fix is the disk text, pushed as a change, so the file stays under observation.
    *
    * The file being edited is skipped: its current text is sent a few lines later anyway.
    */
-  async function dropExternallyChangedDocuments(server: ManagedServer, editedUri: string): Promise<void> {
-    const dropped: string[] = [];
+  async function syncExternallyChangedDocuments(server: ManagedServer, editedUri: string): Promise<void> {
+    const resynced: string[] = [];
+    const closed: string[] = [];
+
     for (const [uri, doc] of server.openDocuments) {
       if (uri === editedUri) continue;
-      let stamp: { mtimeMs: number; size: number } | null;
+      let filePath: string;
       try {
-        stamp = await diskStamp(fileURLToPath(uri));
+        filePath = fileURLToPath(uri);
       } catch {
         continue; // not a local path we can judge
       }
-      if (!stamp || stamp.mtimeMs !== doc.mtimeMs || stamp.size !== doc.size) dropped.push(uri);
-    }
-    if (dropped.length === 0) return;
 
-    for (const uri of dropped) {
+      const stamp = await diskStamp(filePath);
+      if (stamp === null) {
+        closed.push(uri);
+        continue;
+      }
+      if (stamp.mtimeMs === doc.mtimeMs && stamp.size === doc.size) continue;
+
+      let text: string;
+      try {
+        text = await readFile(filePath, "utf-8");
+      } catch {
+        continue; // changed, then unreadable — leave it alone and try again next time
+      }
+      const hash = hashText(text);
+      if (hash === doc.textHash) {
+        // Rewritten with the same content: a checkout of the same commit, a formatter that found
+        // nothing to change. Only the stamp is stale; the server still holds the right text.
+        server.openDocuments.set(uri, { ...doc, mtimeMs: stamp.mtimeMs, size: stamp.size });
+        continue;
+      }
+
+      server.client.didChange(uri, text);
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash: hash });
+      resynced.push(uri);
+    }
+
+    for (const uri of closed) {
+      // The file is gone, so its last measurement describes nothing: drop it along with the document.
+      server.client.forget(uri);
       server.client.didClose(uri);
       server.openDocuments.delete(uri);
     }
-    log.info(
-      server.config.id,
-      `dropped ${dropped.length} document${dropped.length === 1 ? "" : "s"} changed outside the editor`,
-    );
+
+    if (resynced.length > 0) {
+      log.info(
+        server.config.id,
+        `re-sent ${resynced.length} document${resynced.length === 1 ? "" : "s"} rewritten outside the editor`,
+      );
+    }
+    if (closed.length > 0) {
+      log.info(server.config.id, `closed ${closed.length} document${closed.length === 1 ? "" : "s"} deleted outside the editor`);
+    }
   }
 
   async function doEdit(server: ManagedServer, filePath: string): Promise<DiagnosticResult> {
@@ -470,18 +527,28 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     const uri = fileUri(filePath);
     const content = await readFile(filePath, "utf-8");
+    const textHash = hashText(content);
     const stamp = (await diskStamp(filePath)) ?? { mtimeMs: 0, size: content.length };
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
     const retries = getMaxRetries(server.config);
 
-    await dropExternallyChangedDocuments(server, uri);
+    await syncExternallyChangedDocuments(server, uri);
+    const held = server.openDocuments.get(uri);
 
-    if (server.openDocuments.has(uri)) {
+    // The server already holds this exact text. Sending it again would wipe our cached answer, and a
+    // server with nothing new to say sends nothing — the wait would end in a timeout and the file
+    // would be reported as clean. An agent re-writing a file it just wrote hits this every time.
+    if (held && held.textHash === textHash) {
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
+      return await server.client.waitForDiagnostics(uri, UNCHANGED_TEXT_WAIT_MS);
+    }
+
+    if (held) {
       server.client.didChange(uri, content);
     } else {
       server.client.didOpen(uri, languageIdForFile(filePath, server.config), content);
     }
-    server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp });
+    server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
 
     let lastResult = await server.client.waitForDiagnostics(uri, timeout);
 
@@ -492,7 +559,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
 
       server.client.didChange(uri, content);
-      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp });
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
       const result = await server.client.waitForDiagnostics(uri, timeout);
       result.retryAttempts = attempt + 1;
 
@@ -520,14 +587,24 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       return result;
     },
 
-    getAllDiagnostics(): Map<string, Diagnostic[]> {
-      const result = new Map<string, Diagnostic[]>();
+    getAllDiagnostics(): Map<string, FileFindings> {
+      const result = new Map<string, FileFindings>();
       for (const server of servers.values()) {
+        if (!server.client) continue;
         for (const [uri, diags] of server.client.getAllDiagnostics()) {
-          result.set(uri, [...diags]);
+          result.set(uri, { diagnostics: [...diags], watched: server.openDocuments.has(uri) });
         }
       }
       return result;
+    },
+
+    measuredDocuments(): number {
+      let count = 0;
+      for (const server of servers.values()) {
+        if (!server.client) continue;
+        count += server.client.measuredDocuments().length;
+      }
+      return count;
     },
 
     status(): ServerStatus[] {

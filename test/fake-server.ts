@@ -24,6 +24,8 @@ export interface FakeServerOptions {
   neverPublish?: boolean;
   neverShutdown?: boolean;
   publishOnAttempt?: number;
+  /** Model a server that stays silent when a didChange carries the text it already holds. */
+  silentOnIdenticalText?: boolean;
 }
 
 const defaultDiagnostic: Diagnostic = {
@@ -38,6 +40,8 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const crashOnInit = options.crashOnInit ?? false;
   const neverPublish = options.neverPublish ?? false;
   const neverShutdown = options.neverShutdown ?? false;
+  const silentOnIdenticalText = options.silentOnIdenticalText ?? false;
+  const lastText = new Map<string, string>();
   const publishOnAttempt = options.publishOnAttempt ?? 1;
   const attemptCounts = new Map<string, number>();
 
@@ -96,10 +100,15 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   }
 
   connection.onNotification(DidOpenTextDocumentNotification.type, (params) => {
+    lastText.set(params.textDocument.uri, params.textDocument.text);
     publishDiagnostics(params.textDocument.uri);
   });
 
   connection.onNotification(DidChangeTextDocumentNotification.type, (params) => {
+    const text = params.contentChanges[0]?.text ?? "";
+    // A server that re-analyzes and compares does not announce an unchanged answer.
+    if (silentOnIdenticalText && lastText.get(params.textDocument.uri) === text) return;
+    lastText.set(params.textDocument.uri, text);
     publishDiagnostics(params.textDocument.uri);
   });
 
@@ -126,6 +135,7 @@ if (process.argv.includes("--run")) {
     if (raw.neverPublish) options.neverPublish = raw.neverPublish;
     if (raw.neverShutdown) options.neverShutdown = raw.neverShutdown;
     if (raw.publishOnAttempt !== undefined) options.publishOnAttempt = raw.publishOnAttempt;
+    if (raw.silentOnIdenticalText) options.silentOnIdenticalText = raw.silentOnIdenticalText;
     if (raw.diagnosticsByUri) {
       options.diagnosticsByUri = new Map(Object.entries(raw.diagnosticsByUri));
     }

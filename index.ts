@@ -20,8 +20,9 @@ export default function (pi: ExtensionAPI) {
   let health: LspHealth = "unknown";
 
   function footerState(): FooterState {
-    const checked = manager.status().reduce((sum, server) => sum + server.openDocuments, 0);
-    return { ...manager.diagnosticSummary(), checked, health };
+    // Measured, not watched: a file the idle sweep stopped watching still holds the only numbers we
+    // have for it, and "nothing analyzed yet" is a different statement from "nothing is wrong".
+    return { ...manager.diagnosticSummary(), checked: manager.measuredDocuments(), health };
   }
 
   function updateFooter(ctx: ExtensionContext) {
@@ -189,7 +190,9 @@ export default function (pi: ExtensionAPI) {
       if (body === "") {
         const why = requested
           ? `no findings tracked for ${requested}`
-          : "no findings tracked — no document is being measured right now";
+          : footerState().checked === 0
+            ? "nothing has been measured in this session yet — edit a file in a language a server supports"
+            : "the files measured so far came back clean";
         ctx.ui.notify(`${totals}\n${why}`, "info");
         return;
       }

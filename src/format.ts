@@ -135,26 +135,33 @@ const MAX_LEDGER_FILES = 20;
 /** Diagnostics shown for one file there — a clang-tidy cascade must not fill the whole notice. */
 const MAX_LEDGER_ROWS = 10;
 
+/** A file the ledger can list: what was found, and whether a server still watches it. */
+export interface LedgerFile {
+  diagnostics: Diagnostic[];
+  watched: boolean;
+}
+
 /**
- * Everything the footer totals are made of: one block per tracked file, errors first, worst file
+ * Everything the footer totals are made of: one block per measured file, errors first, worst file
  * first. `/lsp-diag` prints it under the footer line so a number in the footer can be checked
  * against the files it came from.
  *
- * Scope is what the servers are measuring now. A file whose document was closed is absent, and its
- * findings are absent with it — that is not a clean bill, it is no measurement.
+ * A file whose document was closed stays and is marked `not watched`: its numbers are the last ones
+ * taken, not current ones, and dropping it would read as a clean bill.
  */
-export function formatDiagnosticLedger(diags: Map<string, Diagnostic[]>, cwd?: string): string {
+export function formatDiagnosticLedger(files: Map<string, LedgerFile>, cwd?: string): string {
   interface LedgerEntry {
     path: string;
     errors: number;
     warnings: number;
     rows: string[];
     hidden: number;
+    watched: boolean;
   }
 
   const entries: LedgerEntry[] = [];
-  for (const [uri, list] of diags) {
-    const relevant = list.filter(
+  for (const [uri, file] of files) {
+    const relevant = file.diagnostics.filter(
       (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
     );
     if (relevant.length === 0) continue;
@@ -173,6 +180,7 @@ export function formatDiagnosticLedger(diags: Map<string, Diagnostic[]>, cwd?: s
       warnings: sorted.length - errors,
       rows,
       hidden: sorted.length - rows.length,
+      watched: file.watched,
     });
   }
 
@@ -186,11 +194,21 @@ export function formatDiagnosticLedger(diags: Map<string, Diagnostic[]>, cwd?: s
       e.errors > 0 ? `${e.errors} error${e.errors > 1 ? "s" : ""}` : "",
       e.warnings > 0 ? `${e.warnings} warning${e.warnings > 1 ? "s" : ""}` : "",
     ].filter(Boolean).join(", ");
+    const stale = e.watched ? "" : ", last measurement";
     const hidden = e.hidden > 0 ? `\n  ... and ${e.hidden} more in this file` : "";
-    return `${e.path} (${counts}):\n${e.rows.join("\n")}${hidden}`;
+    return `${e.path} (${counts}${stale}):\n${e.rows.join("\n")}${hidden}`;
   });
 
   const hiddenFiles = entries.length - shown.length;
-  const note = hiddenFiles > 0 ? `\n... and ${hiddenFiles} more file${hiddenFiles === 1 ? "" : "s"} with diagnostics` : "";
-  return blocks.join("\n") + note;
+  const parts = [blocks.join("\n")];
+  if (hiddenFiles > 0) {
+    parts.push(`... and ${hiddenFiles} more file${hiddenFiles === 1 ? "" : "s"} with diagnostics`);
+  }
+  const unwatched = shown.filter((e) => !e.watched).length;
+  if (unwatched > 0) {
+    parts.push(
+      `${unwatched} of ${shown.length} ${shown.length === 1 ? "file is" : "files are"} no longer watched: those are the last numbers taken, not current ones.`,
+    );
+  }
+  return parts.join("\n");
 }

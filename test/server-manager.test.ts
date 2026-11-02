@@ -86,7 +86,7 @@ describe("ServerManager", () => {
     await manager.shutdownAll();
   });
 
-  it("closes a document that changed outside the editor", async () => {
+  it("keeps measuring a document that something outside the editor rewrote", async () => {
     const manager = createServerManager();
     const dir = await makeTempDir();
     await writeFile(join(dir, "go.mod"), "module test");
@@ -103,11 +103,53 @@ describe("ServerManager", () => {
     await writeFile(fileB, "package main\n// rewritten by sed\n");
 
     await manager.handleEdit(fileA, fakeConfig, dir);
-    assert.equal(manager.status()[0].openDocuments, 1);
 
-    // Editing it again opens it fresh, from the text now on disk.
-    await manager.handleEdit(fileB, fakeConfig, dir);
+    // The disk text is pushed at the server and the file stays under observation. Closing it would
+    // have been the cheap answer and would have lost the file from every later report.
     assert.equal(manager.status()[0].openDocuments, 2);
+    await new Promise((resolve) => setTimeout(resolve, 300)); // let the re-sent document be answered
+    assert.equal(manager.getAllDiagnostics().size, 2);
+    for (const [uri, file] of manager.getAllDiagnostics()) {
+      assert.ok(file.watched, `expected ${uri} to still be watched`);
+    }
+
+    await manager.shutdownAll();
+  });
+
+  it("treats a rewrite with the same content as no change", async () => {
+    // clangd answers a didChange whose text it already holds by staying quiet: the answer did not
+    // change, so there is nothing to announce. A client that waits for an announcement reports the
+    // file as timed out and loses the errors it had.
+    const silentConfig: LanguageServerConfig = {
+      ...fakeConfig,
+      id: "fakesilent",
+      args: [fakeServerPath, "--run", '--options={"silentOnIdenticalText":true}'],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 300, maxRetries: 1 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    const text = "package main\n// broken\n";
+    await writeFile(filePath, text);
+
+    const first = await manager.handleEdit(filePath, silentConfig, dir);
+    assert.equal(first.status, "ok");
+    assert.equal(manager.diagnosticSummary().errors, 1);
+
+    // The agent writes the file again with the text it just read. mtime moves, content does not.
+    await writeFile(filePath, text);
+    const started = Date.now();
+    const second = await manager.handleEdit(filePath, silentConfig, dir);
+    const elapsed = Date.now() - started;
+
+    assert.equal(second.status, "ok", "an unchanged write is answered from the cached measurement");
+    assert.equal(manager.diagnosticSummary().errors, 1, "the error is still counted");
+    assert.ok(elapsed < 600, `expected a short settle, took ${elapsed}ms`);
+
+    // A real change still goes to the server and is measured again.
+    await writeFile(filePath, "package main\n// really edited\n");
+    const third = await manager.handleEdit(filePath, silentConfig, dir);
+    assert.equal(third.status, "ok");
 
     await manager.shutdownAll();
   });
@@ -204,19 +246,22 @@ describe("ServerManager", () => {
 
     const tracked = manager.getAllDiagnostics();
     assert.equal(tracked.size, 2);
-    for (const [uri, diags] of tracked) {
-      assert.ok(diags.length > 0, `expected findings for ${uri}`);
+    for (const [uri, file] of tracked) {
+      assert.ok(file.diagnostics.length > 0, `expected findings for ${uri}`);
+      assert.ok(file.watched, `expected ${uri} to be watched`);
     }
 
-    // The footer reads the same map, so the two can never disagree about what is measured.
-    const counted = [...tracked.values()].flat().filter((d) => d.severity === 1).length;
+    // The footer reads the same measurements, so the two can never disagree about what is counted.
+    const counted = [...tracked.values()].flatMap((f) => f.diagnostics).filter((d) => d.severity === 1).length;
     assert.equal(manager.diagnosticSummary().errors, counted);
 
     // Callers get copies: a renderer that sorts or trims must not corrupt the cache.
     const first = [...tracked.values()][0];
-    const before = first.length;
-    first.length = 0;
-    assert.equal([...manager.getAllDiagnostics().values()][0].length, before);
+    const before = first.diagnostics.length;
+    first.diagnostics.length = 0;
+    assert.equal([...manager.getAllDiagnostics().values()][0].diagnostics.length, before);
+
+    assert.equal(manager.measuredDocuments(), 2);
 
     await manager.shutdownAll();
     assert.equal(manager.getAllDiagnostics().size, 0);

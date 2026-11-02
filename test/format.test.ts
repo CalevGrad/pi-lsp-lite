@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatDiagnostics, formatDiagnosticLedger } from "../src/format.js";
+import { formatDiagnostics, formatDiagnosticLedger, type LedgerFile } from "../src/format.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import type { DiagnosticResult } from "../src/client.js";
 import { pathToFileURL } from "node:url";
@@ -325,26 +325,28 @@ describe("formatDiagnostics", () => {
 });
 
 describe("formatDiagnosticLedger", () => {
+  const watched = (diagnostics: Diagnostic[]): LedgerFile => ({ diagnostics, watched: true });
+
   it("returns empty text when nothing is tracked", () => {
     assert.equal(formatDiagnosticLedger(new Map(), "/project"), "");
   });
 
   it("skips files with nothing but info and hint findings", () => {
-    const map = new Map<string, Diagnostic[]>([
-      ["file:///project/noise.go", [makeDiag(DiagnosticSeverity.Information, "unresolved", 1)]],
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/noise.go", watched([makeDiag(DiagnosticSeverity.Information, "unresolved", 1)])],
     ]);
     assert.equal(formatDiagnosticLedger(map, "/project"), "");
   });
 
   it("lists the worst file first and errors before warnings inside it", () => {
-    const map = new Map<string, Diagnostic[]>([
-      ["file:///project/mild.go", [makeDiag(DiagnosticSeverity.Warning, "unused import", 3)]],
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/mild.go", watched([makeDiag(DiagnosticSeverity.Warning, "unused import", 3)])],
       [
         "file:///project/severe.go",
-        [
+        watched([
           makeDiag(DiagnosticSeverity.Warning, "later warning", 9),
           makeDiag(DiagnosticSeverity.Error, "undefined symbol", 2),
-        ],
+        ]),
       ],
     ]);
 
@@ -358,13 +360,28 @@ describe("formatDiagnosticLedger", () => {
     assert.ok(output.indexOf("undefined symbol") < output.indexOf("later warning"), output);
   });
 
+  it("marks a file that is no longer watched so its numbers read as the last ones taken", () => {
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/live.go", watched([makeDiag(DiagnosticSeverity.Error, "undefined symbol", 1)])],
+      [
+        "file:///project/closed.go",
+        { diagnostics: [makeDiag(DiagnosticSeverity.Error, "stale error", 2)], watched: false },
+      ],
+    ]);
+
+    const output = formatDiagnosticLedger(map, "/project");
+    assert.ok(output.includes("closed.go (1 error, last measurement):"), output);
+    assert.ok(output.includes("live.go (1 error):"), output);
+    assert.ok(output.includes("1 of 2 files are no longer watched"), output);
+  });
+
   it("caps rows per file and files per listing", () => {
     const rows = (count: number) =>
       Array.from({ length: count }, (_, i) => makeDiag(DiagnosticSeverity.Error, `e${i}`, i));
 
-    const map = new Map<string, Diagnostic[]>();
+    const map = new Map<string, LedgerFile>();
     for (let i = 0; i < 25; i++) {
-      map.set(`file:///project/f${String(i).padStart(2, "0")}.go`, rows(15));
+      map.set(`file:///project/f${String(i).padStart(2, "0")}.go`, watched(rows(15)));
     }
 
     const crowded = formatDiagnosticLedger(map, "/project");
@@ -372,7 +389,7 @@ describe("formatDiagnosticLedger", () => {
     assert.equal(crowded.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 200, crowded);
     assert.equal(crowded.split("\n").filter((l) => l.includes("more in this file")).length, 20, crowded);
 
-    const oneCrowdedFile = new Map<string, Diagnostic[]>([["file:///project/one.go", rows(15)]]);
+    const oneCrowdedFile = new Map<string, LedgerFile>([["file:///project/one.go", watched(rows(15))]]);
     const single = formatDiagnosticLedger(oneCrowdedFile, "/project");
     assert.ok(single.includes("... and 5 more in this file"), single);
     assert.equal(single.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 10, single);

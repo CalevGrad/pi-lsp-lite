@@ -177,23 +177,40 @@ drops the cache and the notices, so the next edit re-reads everything.
 
 - Lazy start on first relevant edit
 - Idle shutdown after `serverIdleTimeout` without edits (default 30 min, `0` disables it). Long on purpose: a stopped server makes the next edit pay a cold start, and that arrives as a `timeout` in the report
-- Periodic 60s sweep closes documents idle > 120s
+- Periodic 60s sweep closes documents idle > 120s. Closing stops the measurement; it does not erase the last one (see below)
 - Session shutdown sends the LSP `shutdown` request (5 s cap), then escalates SIGTERM → SIGKILL with a 2 s grace
 
 ### External file changes
 
-Each open document remembers the mtime and size of the file whose text was last sent to the server.
-Before every check those stamps are compared with the disk, and a document that no longer matches — or
-whose file is gone — is closed with `didClose` and dropped from the tracking map. The server was parsing
-our copy of the file; after a close clangd reads the file from disk again when a translation unit needs
-it, and the next edit of that file opens it fresh with the current text. The file being edited is skipped,
-since its text is sent moments later.
+Each open document remembers the mtime, size and text hash of what was last sent to the server. Before
+every check those stamps are compared with the disk for the other open documents. A mismatch is resolved
+by pushing the current disk text as a `didChange`, so the file stays under observation and the next
+report measures what is actually on disk. A rewrite with identical content — a checkout of the same
+commit, a formatter that found nothing to fix — refreshes the stamp only. A file that is gone is closed
+with `didClose` and its measurement is dropped with `forget()`, because it describes nothing. The file
+being edited is skipped, since its text is sent moments later.
 
 This is the invalidation an LSP client normally gets from `workspace/didChangeWatchedFiles`. Pi gives no
 signal about files a bash command rewrote, and the client declares no watched-files capability, so the
-disk stamps stand in for it. `didClose` also drops the document's cached diagnostics, which is right: an
-entry measured against the old text must not become a "changed other file" report for an edit that never
-touched it.
+disk stamps stand in for it. The text hash is what makes the comparison honest: mtime and size say a file
+was written, never whether the text differs, and those two answers need different handling.
+
+### Unchanged text and the life of a measurement
+
+An agent often writes a file back with the text it just read. The server holds that text, re-analyzes, and
+sends nothing — it has no new answer to announce. A client that treats "a `publishDiagnostics` arrived" as
+the only finish line waits for news that never comes, and a wait that started by clearing the cached answer
+ends with the file reported as clean. So `doEdit` compares text hashes first and answers an unchanged write
+from the cache with one short wait, no `didChange`, no retries.
+
+A measurement outlives the document it came from: `didClose` keeps the entry and `getAllDiagnostics()`
+marks it `watched: false`, because a file we stopped watching is not a clean file. That is what keeps the
+footer showing `LSP: 2 errors` after the idle sweep closed the document, instead of clearing the row and
+reading as "checked, all fine". `/lsp-diag` marks such files `last measurement` and says how many of the
+listed files are unwatched. Retained measurements are capped at 200 closed documents, oldest dropped
+first, and they die with the server that made them — a restarted clangd has measured nothing. `didOpen`
+removes the URI from that queue: an open document must never compete for the cap, or an overflow would
+erase the findings of a file we are watching right now.
 
 ### Failure isolation
 

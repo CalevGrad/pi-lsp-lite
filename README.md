@@ -166,10 +166,11 @@ Notes:
 1. Agent writes/edits a file
 2. Extension detects the language, finds the workspace root
 3. Spawns (or reuses) an LSP server for that language + root
-4. Closes any open document an outside tool rewrote since we sent it
-5. Sends `didChange`, waits for `publishDiagnostics`
-6. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
-7. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
+4. Skips the check if the file holds the exact text the server already has
+5. Pushes the disk text of any open document an outside tool rewrote
+6. Sends `didChange`, waits for `publishDiagnostics`
+7. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
+8. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
 Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
 that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`. This works only for files the server
@@ -178,10 +179,16 @@ file was reported the end of the report says `dependents: not checked (only file
 were compared)` rather than leaving an empty list to be read as "nothing else is affected".
 
 A file we hold open can also change without us: `git checkout`, `sed -i`, a formatter run by hand or
-through bash. Before each check the extension compares the open files against the disk and closes every
-one whose timestamp and size no longer match the text the server was given — otherwise the server keeps
-parsing our old copy and reports real errors on wrong lines. `/lsp-log` records those closures, and the
-next edit of such a file opens it again from disk.
+through bash. Before each check the extension compares the open files against the disk and pushes the
+current text of every one whose content no longer matches what the server was given — otherwise the
+server keeps parsing our old copy and reports real errors on wrong lines. A rewrite that changed nothing
+(a checkout of the same commit) only refreshes the timestamp. `/lsp-log` records what was re-sent. A file
+that was deleted is closed and its numbers are dropped, since they describe nothing.
+
+The other case is a write of the same text — an agent rewriting a file it just wrote. The server holds
+that text already and answers it with silence, because the answer did not change. Sending it anyway used
+to throw away the cached errors and end in a timeout after several retries: minutes of waiting and a
+report saying the file is clean.
 
 The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
 for other files, errors first, one line per diagnostic — long clangd template errors fold into one line.

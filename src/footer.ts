@@ -12,7 +12,10 @@ export interface FooterTheme {
 }
 
 export interface FooterState extends DiagnosticSummary {
-  /** Documents open in live servers. Zero means nothing has been analyzed. */
+  /**
+   * Documents an answer arrived for this session, watched or not. Zero means nothing has been
+   * analyzed — which is not the same claim as "the files are clean".
+   */
   checked: number;
   health: LspHealth;
 }
