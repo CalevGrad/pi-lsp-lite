@@ -14,9 +14,20 @@ import {
   type AppliedCdb,
   type CdbResolution,
 } from "./compile-commands.js";
-import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
+import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES, DEFAULT_SERVER_IDLE_TIMEOUT } from "./config.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
 import { readFile, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+interface OpenDocument {
+  lastActivity: number;
+  /**
+   * Disk stamp of the text the server currently holds. A mismatch with the disk means something
+   * outside the editor rewrote the file between our edits — `git checkout`, `sed -i`, a formatter.
+   */
+  mtimeMs: number;
+  size: number;
+}
 
 interface ManagedServer {
   config: LanguageServerConfig;
@@ -24,7 +35,7 @@ interface ManagedServer {
   root: string;
   process: ChildProcess;
   client: LspClient;
-  openDocuments: Map<string, number>;
+  openDocuments: Map<string, OpenDocument>;
   idleTimer: ReturnType<typeof setTimeout> | null;
   startTime: number;
   lastActivity: number;
@@ -71,7 +82,6 @@ export interface ServerStatus {
   args: string[];
 }
 
-const IDLE_TIMEOUT_MS = 240_000;
 const INIT_TIMEOUT_MS = 10_000;
 const SWEEP_INTERVAL_MS = 60_000;
 // Matches clangd's own RevalidateMissingAfter: how often we re-probe the
@@ -84,6 +94,8 @@ const MAX_CDB_CACHE_ENTRIES = 256;
 export interface ServerManagerOptions {
   diagnosticTimeout?: number;
   documentIdleTimeout?: number;
+  /** Milliseconds without edits before a server is stopped. 0 stops never. */
+  serverIdleTimeout?: number;
   perServerTimeout?: Map<string, number>;
   maxRetries?: number;
 }
@@ -94,6 +106,7 @@ const MAX_RETRY_DELAY_MS = 30_000;
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
   const diagnosticTimeout = options.diagnosticTimeout ?? DEFAULT_DIAGNOSTIC_TIMEOUT;
   const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  const serverIdleTimeout = options.serverIdleTimeout ?? DEFAULT_SERVER_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const servers = new Map<string, ManagedServer>();
@@ -111,7 +124,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       const now = Date.now();
       for (const server of servers.values()) {
         const stale = [...server.openDocuments.entries()]
-          .filter(([, lastActive]) => now - lastActive > documentIdleTimeout);
+          .filter(([, doc]) => now - doc.lastActivity > documentIdleTimeout);
         for (const [docUri] of stale) {
           server.client.didClose(docUri);
           server.openDocuments.delete(docUri);
@@ -131,7 +144,8 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   function resetIdleTimer(server: ManagedServer) {
     if (server.idleTimer) clearTimeout(server.idleTimer);
     server.lastActivity = Date.now();
-    server.idleTimer = setTimeout(() => shutdownServer(server), IDLE_TIMEOUT_MS);
+    if (serverIdleTimeout === 0) return;
+    server.idleTimer = setTimeout(() => shutdownServer(server), serverIdleTimeout);
   }
 
   async function killProcess(proc: ChildProcess): Promise<void> {
@@ -403,20 +417,66 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
+  /** mtime and size of a file, or null when it is no longer on disk. */
+  async function diskStamp(filePath: string): Promise<{ mtimeMs: number; size: number } | null> {
+    try {
+      const info = await stat(filePath);
+      return { mtimeMs: info.mtimeMs, size: info.size };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Stop trusting documents the disk changed under. Anything can rewrite a file between our
+   * edits — `git checkout`, `sed -i`, a formatter run — and until the server hears about it it
+   * keeps parsing the text we sent: line numbers drift, and diagnostics that no longer exist keep
+   * coming back. Closing is enough to fix that. clangd reads an included file from disk again when
+   * it parses a translation unit that needs it, and the next edit of that file opens it fresh.
+   *
+   * The file being edited is skipped: its current text is sent a few lines later anyway.
+   */
+  async function dropExternallyChangedDocuments(server: ManagedServer, editedUri: string): Promise<void> {
+    const dropped: string[] = [];
+    for (const [uri, doc] of server.openDocuments) {
+      if (uri === editedUri) continue;
+      let stamp: { mtimeMs: number; size: number } | null;
+      try {
+        stamp = await diskStamp(fileURLToPath(uri));
+      } catch {
+        continue; // not a local path we can judge
+      }
+      if (!stamp || stamp.mtimeMs !== doc.mtimeMs || stamp.size !== doc.size) dropped.push(uri);
+    }
+    if (dropped.length === 0) return;
+
+    for (const uri of dropped) {
+      server.client.didClose(uri);
+      server.openDocuments.delete(uri);
+    }
+    log.info(
+      server.config.id,
+      `dropped ${dropped.length} document${dropped.length === 1 ? "" : "s"} changed outside the editor`,
+    );
+  }
+
   async function doEdit(server: ManagedServer, filePath: string): Promise<DiagnosticResult> {
     resetIdleTimer(server);
 
     const uri = fileUri(filePath);
     const content = await readFile(filePath, "utf-8");
+    const stamp = (await diskStamp(filePath)) ?? { mtimeMs: 0, size: content.length };
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
     const retries = getMaxRetries(server.config);
+
+    await dropExternallyChangedDocuments(server, uri);
 
     if (server.openDocuments.has(uri)) {
       server.client.didChange(uri, content);
     } else {
       server.client.didOpen(uri, languageIdForFile(filePath, server.config), content);
     }
-    server.openDocuments.set(uri, Date.now());
+    server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp });
 
     let lastResult = await server.client.waitForDiagnostics(uri, timeout);
 
@@ -427,7 +487,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
 
       server.client.didChange(uri, content);
-      server.openDocuments.set(uri, Date.now());
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp });
       const result = await server.client.waitForDiagnostics(uri, timeout);
       result.retryAttempts = attempt + 1;
 

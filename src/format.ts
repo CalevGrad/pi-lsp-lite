@@ -92,8 +92,14 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
 
   const hidden = sorted.length - relevant.length;
   const truncatedNote = hidden > 0 ? `\n  ... and ${hidden} more diagnostics in this file` : "";
+  // Files that merely use the changed code are never looked up; the list above only contains files
+  // the server reported on by itself. Say so while we already have the reader's attention, instead
+  // of letting an empty list read as "nothing else is affected".
+  const dependentsNote = result.otherFiles.length === 0
+    ? `\n  dependents: not checked (only files the server mentioned were compared)`
+    : "";
 
-  return `\n⚠ LSP diagnostics for ${filePath} (${summary}):\n${lines.join("\n")}${truncatedNote}${otherFilesFooter(result, cwd)}`;
+  return `\n⚠ LSP diagnostics for ${filePath} (${summary}):\n${lines.join("\n")}${truncatedNote}${otherFilesFooter(result, cwd)}${dependentsNote}`;
 }
 
 function otherFilesFooter(result: DiagnosticResult, cwd?: string): string {

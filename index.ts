@@ -37,6 +37,7 @@ export default function (pi: ExtensionAPI) {
     manager = createServerManager({
       diagnosticTimeout: resolved.diagnosticTimeout,
       documentIdleTimeout: resolved.documentIdleTimeout,
+      serverIdleTimeout: resolved.serverIdleTimeout,
       perServerTimeout: resolved.perServerTimeout,
     });
 

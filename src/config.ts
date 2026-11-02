@@ -23,12 +23,14 @@ export interface UserConfig {
   servers?: Record<string, ServerConfigOverride>;
   diagnosticTimeout?: number;
   documentIdleTimeout?: number;
+  serverIdleTimeout?: number;
 }
 
 export interface ResolvedConfig {
   servers: LanguageServerConfig[];
   diagnosticTimeout: number;
   documentIdleTimeout: number;
+  serverIdleTimeout: number;
   perServerTimeout: Map<string, number>;
 }
 
@@ -36,10 +38,19 @@ export const DEFAULT_DIAGNOSTIC_TIMEOUT = 5_000;
 export const DEFAULT_DOCUMENT_IDLE_TIMEOUT = 120_000;
 export const DEFAULT_MAX_RETRIES = 3;
 
+/**
+ * How long a server may sit without edits before it is stopped. Generous on purpose: a
+ * reading or review gap is normal in an agent session, and killing the server makes the next
+ * edit pay a cold start, which shows up in the report as a timeout. 0 disables stopping.
+ */
+export const DEFAULT_SERVER_IDLE_TIMEOUT = 1_800_000;
+
 const MIN_DIAGNOSTIC_TIMEOUT = 1_000;
 const MAX_DIAGNOSTIC_TIMEOUT = 60_000;
 const MIN_DOCUMENT_IDLE_TIMEOUT = 10_000;
 const MAX_DOCUMENT_IDLE_TIMEOUT = 600_000;
+const MIN_SERVER_IDLE_TIMEOUT = 60_000;
+const MAX_SERVER_IDLE_TIMEOUT = 14_400_000;
 const MIN_MAX_RETRIES = 0;
 const MAX_MAX_RETRIES = 10;
 const MIN_CDB_MAX_DEPTH = 1;
@@ -319,6 +330,7 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
   const perServerTimeout = new Map<string, number>();
   let diagnosticTimeout = DEFAULT_DIAGNOSTIC_TIMEOUT;
   let documentIdleTimeout = DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  let serverIdleTimeout = DEFAULT_SERVER_IDLE_TIMEOUT;
 
   const layers: [UserConfig | null, ConfigSource][] = [
     [globalConfig, "global"],
@@ -340,7 +352,13 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
     if (layer.documentIdleTimeout !== undefined) {
       documentIdleTimeout = clamp(layer.documentIdleTimeout, MIN_DOCUMENT_IDLE_TIMEOUT, MAX_DOCUMENT_IDLE_TIMEOUT, documentIdleTimeout);
     }
+    if (layer.serverIdleTimeout !== undefined) {
+      // 0 is a setting, not an out-of-range number: it means "never stop a running server".
+      serverIdleTimeout = layer.serverIdleTimeout === 0
+        ? 0
+        : clamp(layer.serverIdleTimeout, MIN_SERVER_IDLE_TIMEOUT, MAX_SERVER_IDLE_TIMEOUT, serverIdleTimeout);
+    }
   }
 
-  return { servers, diagnosticTimeout, documentIdleTimeout, perServerTimeout };
+  return { servers, diagnosticTimeout, documentIdleTimeout, serverIdleTimeout, perServerTimeout };
 }

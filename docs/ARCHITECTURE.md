@@ -61,6 +61,8 @@ Diagnostic collection uses a two-trigger approach to handle both direct and cros
 
 **Why quiescence, not immediate settle:** LSP servers often publish diagnostics for multiple files in rapid succession after a change. The 200ms window collects them all before reporting.
 
+**Coverage limit:** the diff only sees files the server publishes about on its own. Users of the changed code are never looked up (`textDocument/references` is not called), so an empty `otherFiles` proves nothing about dependents. A finished check whose list is empty says so in the report instead of leaving the silence to be read as "nothing else is affected".
+
 **Why compare against the snapshot:** A stale re-publish (server re-confirming existing diagnostics) doesn't change counts relative to the snapshot, so it's ignored. Only genuine impact from the current edit triggers settling. This prevents false positives when the server republishes for unrelated files.
 
 **Timeout fallback:** If neither trigger fires within the per-language timeout (gopls: 5s, rust-analyzer: 30s, typescript: 30s), the wait settles with `status: "timeout"`. The server-manager then retries the edit with exponential backoff (base 500ms × 2^attempt, capped at 30s per delay, plus 0-50% random jitter) up to `maxRetries` times (default 3). If any retry succeeds, that result is returned. If all retries are exhausted, the final timeout result includes `retryAttempts` so the agent/user knows the extension tried. Cross-file data collected up to that point is still included in `otherFiles`.
@@ -174,9 +176,24 @@ drops the cache and the notices, so the next edit re-reads everything.
 ### Server lifecycle
 
 - Lazy start on first relevant edit
-- Idle shutdown after 240s of no edits
+- Idle shutdown after `serverIdleTimeout` without edits (default 30 min, `0` disables it). Long on purpose: a stopped server makes the next edit pay a cold start, and that arrives as a `timeout` in the report
 - Periodic 60s sweep closes documents idle > 120s
 - Session shutdown sends the LSP `shutdown` request (5 s cap), then escalates SIGTERM → SIGKILL with a 2 s grace
+
+### External file changes
+
+Each open document remembers the mtime and size of the file whose text was last sent to the server.
+Before every check those stamps are compared with the disk, and a document that no longer matches — or
+whose file is gone — is closed with `didClose` and dropped from the tracking map. The server was parsing
+our copy of the file; after a close clangd reads the file from disk again when a translation unit needs
+it, and the next edit of that file opens it fresh with the current text. The file being edited is skipped,
+since its text is sent moments later.
+
+This is the invalidation an LSP client normally gets from `workspace/didChangeWatchedFiles`. Pi gives no
+signal about files a bash command rewrote, and the client declares no watched-files capability, so the
+disk stamps stand in for it. `didClose` also drops the document's cached diagnostics, which is right: an
+entry measured against the old text must not become a "changed other file" report for an edit that never
+touched it.
 
 ### Failure isolation
 

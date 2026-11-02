@@ -47,6 +47,32 @@ describe("formatDiagnostics", () => {
     assert.equal(output, "");
   });
 
+  it("says dependents were not checked when the server mentioned no other file", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.includes("undefined variable"));
+    assert.ok(output.includes("dependents: not checked"));
+  });
+
+  it("does not add the dependents note when the server did report another file", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
+      otherFiles: [{ uri: "file:///project/caller.go", errorCount: 1, warningCount: 0 }],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.includes("caller.go"));
+    assert.ok(!output.includes("dependents: not checked"));
+  });
+
   it("returns timeout message for timeout with no diagnostics", () => {
     const result: DiagnosticResult = {
       status: "timeout",
@@ -215,7 +241,7 @@ describe("formatDiagnostics", () => {
       retryAttempts: 0,
     };
 
-    const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => l.startsWith("  "));
+    const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => /^  (error|warning) /.test(l));
     assert.deepEqual(lines.map((l) => l.trim().split(" ")[0]), ["error", "warning", "warning"]);
   });
 
@@ -243,7 +269,7 @@ describe("formatDiagnostics", () => {
     };
 
     const output = formatDiagnostics("main.cpp", result);
-    assert.equal(output.split("\n").length, 3, `blank + header + one diagnostic line: ${output}`);
+    assert.equal(output.split("\n").length, 4, `blank + header + one diagnostic line + the dependents note: ${output}`);
     assert.ok(output.includes("no matching function candidate ignored type erased here"), output);
   });
 

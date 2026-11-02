@@ -115,6 +115,7 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | `servers.<id>.cdbMaxDepth` | How deep to look, in path segments (1-8) | `3` |
 | `diagnosticTimeout` | Global default timeout (ms) | `5000` |
 | `documentIdleTimeout` | Close idle documents after (ms) | `120000` |
+| `serverIdleTimeout` | Stop an unused server after (ms); `0` never stops one | `1800000` |
 
 Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
 
@@ -164,19 +165,32 @@ Notes:
 1. Agent writes/edits a file
 2. Extension detects the language, finds the workspace root
 3. Spawns (or reuses) an LSP server for that language + root
-4. Sends `didChange`, waits for `publishDiagnostics`
-5. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
-6. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
+4. Closes any open document an outside tool rewrote since we sent it
+5. Sends `didChange`, waits for `publishDiagnostics`
+6. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
+7. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
 Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
-that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`.
+that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`. This works only for files the server
+speaks about on its own. The extension does not look up who uses the code you changed, so when no other
+file was reported the end of the report says `dependents: not checked (only files the server mentioned
+were compared)` rather than leaving an empty list to be read as "nothing else is affected".
+
+A file we hold open can also change without us: `git checkout`, `sed -i`, a formatter run by hand or
+through bash. Before each check the extension compares the open files against the disk and closes every
+one whose timestamp and size no longer match the text the server was given — otherwise the server keeps
+parsing our old copy and reports real errors on wrong lines. `/lsp-log` records those closures, and the
+next edit of such a file opens it again from disk.
 
 The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
 for other files, errors first, one line per diagnostic — long clangd template errors fold into one line.
 The summary above them still counts everything, so `137 errors` and `... and 117 more diagnostics in this
 file` appear in the same report.
 
-Servers are lazy (spawn on first edit), idle-shutdown after 240s, and clean up on session end.
+Servers are lazy (spawn on first edit), stop after 30 minutes without edits (`serverIdleTimeout`; set it to
+`0` to keep them for the whole session), and clean up on session end. The timeout is long because a
+reading or review gap is normal, and a stopped server makes the next edit wait for a fresh start —
+which arrives in the report as a timeout.
 
 ## Development
 

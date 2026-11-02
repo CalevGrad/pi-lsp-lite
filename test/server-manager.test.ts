@@ -86,6 +86,50 @@ describe("ServerManager", () => {
     await manager.shutdownAll();
   });
 
+  it("closes a document that changed outside the editor", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const fileA = join(dir, "a.go");
+    const fileB = join(dir, "b.go");
+    await writeFile(fileA, "package main");
+    await writeFile(fileB, "package main");
+
+    await manager.handleEdit(fileA, fakeConfig, dir);
+    await manager.handleEdit(fileB, fakeConfig, dir);
+    assert.equal(manager.status()[0].openDocuments, 2);
+
+    // Something outside the editor rewrites b.go while the server still holds our text of it.
+    await writeFile(fileB, "package main\n// rewritten by sed\n");
+
+    await manager.handleEdit(fileA, fakeConfig, dir);
+    assert.equal(manager.status()[0].openDocuments, 1);
+
+    // Editing it again opens it fresh, from the text now on disk.
+    await manager.handleEdit(fileB, fakeConfig, dir);
+    assert.equal(manager.status()[0].openDocuments, 2);
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps documents that nobody touched on disk", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const fileA = join(dir, "a.go");
+    const fileB = join(dir, "b.go");
+    await writeFile(fileA, "package main");
+    await writeFile(fileB, "package main");
+
+    await manager.handleEdit(fileA, fakeConfig, dir);
+    await manager.handleEdit(fileB, fakeConfig, dir);
+    await manager.handleEdit(fileA, fakeConfig, dir);
+
+    assert.equal(manager.status()[0].openDocuments, 2);
+
+    await manager.shutdownAll();
+  });
+
   it("concurrent first edits don't spawn duplicate servers", async () => {
     const manager = createServerManager();
     const dir = await makeTempDir();

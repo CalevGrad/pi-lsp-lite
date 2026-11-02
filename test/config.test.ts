@@ -31,6 +31,7 @@ describe("loadConfig", () => {
     assert.ok(config.servers.some((s) => s.id === "typescript"));
     assert.equal(config.diagnosticTimeout, 5000);
     assert.equal(config.documentIdleTimeout, 120000);
+    assert.equal(config.serverIdleTimeout, 1800000);
   });
 
   it("project config can tune existing server retry behaviour", async () => {
@@ -229,6 +230,48 @@ describe("loadConfig", () => {
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
     assert.equal(config.documentIdleTimeout, 60000);
+  });
+
+  it("overrides serverIdleTimeout", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      serverIdleTimeout: 300000,
+    }));
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(config.serverIdleTimeout, 300000);
+  });
+
+  it("keeps serverIdleTimeout 0 as 'never stop a server'", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      serverIdleTimeout: 0,
+    }));
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(config.serverIdleTimeout, 0);
+  });
+
+  it("clamps serverIdleTimeout to the allowed range", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      serverIdleTimeout: 1000,
+    }));
+    const low = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(low.serverIdleTimeout, 60000);
+
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      serverIdleTimeout: 999_999_999,
+    }));
+    const high = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(high.serverIdleTimeout, 14400000);
+  });
+
+  it("ignores non-numeric serverIdleTimeout", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      serverIdleTimeout: "never",
+    }));
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(config.serverIdleTimeout, 1800000);
   });
 
   it("per-server diagnosticTimeout override", async () => {
