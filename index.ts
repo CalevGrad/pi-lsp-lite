@@ -2,13 +2,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { isEditToolResult, isWriteToolResult } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
-import { formatDiagnostics } from "./src/format.js";
 import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
-import { which, isInsideCwd } from "./src/util.js";
+import { which, isInsideCwd, fileUri } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
 import { errText, formatLogEntry, log } from "./src/log.js";
-import { formatFooterStatus, type LspHealth } from "./src/footer.js";
+import { formatFooterStatus, type FooterState, type LspHealth } from "./src/footer.js";
+import { formatDiagnostics, formatDiagnosticLedger } from "./src/format.js";
 import { resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
@@ -19,10 +19,13 @@ export default function (pi: ExtensionAPI) {
   let manager = createServerManager({});
   let health: LspHealth = "unknown";
 
-  function updateFooter(ctx: ExtensionContext) {
+  function footerState(): FooterState {
     const checked = manager.status().reduce((sum, server) => sum + server.openDocuments, 0);
-    const state = { ...manager.diagnosticSummary(), checked, health };
-    ctx.ui.setStatus("lsp", formatFooterStatus(state, ctx.ui.theme));
+    return { ...manager.diagnosticSummary(), checked, health };
+  }
+
+  function updateFooter(ctx: ExtensionContext) {
+    ctx.ui.setStatus("lsp", formatFooterStatus(footerState(), ctx.ui.theme));
   }
 
   function clearFooter(ctx: ExtensionContext) {
@@ -156,6 +159,43 @@ export default function (pi: ExtensionAPI) {
       const hidden = matched.length - shown.length;
       const summary = `${shown.length}/${matched.length} entries${query ? ` matching "${query}"` : ""}${hidden > 0 ? `, ${hidden} older hidden` : ""}`;
       ctx.ui.notify([summary, ...shown.map(formatLogEntry)].join("\n"), "warning");
+    },
+  });
+
+  pi.registerCommand("lsp-diag", {
+    description: "Show the findings behind the footer totals, or one file with '/lsp-diag <path>'",
+    handler: async (args, ctx) => {
+      const requested = args?.trim().replace(/^@/, "");
+
+      // Documents are keyed by the realpath'd URI, the same normalization the edit hook applies, or
+      // `/lsp-diag ./x.cpp` would match nothing on a path through a symlink.
+      let filterUri: string | undefined;
+      if (requested) {
+        const absolute = resolve(ctx.cwd, requested);
+        let canonical = absolute;
+        try {
+          canonical = await realpath(absolute);
+        } catch {
+          // the file may be deleted; match the path as typed
+        }
+        filterUri = fileUri(canonical);
+      }
+
+      const tracked = manager.getAllDiagnostics();
+      const scope = filterUri ? new Map([...tracked].filter(([uri]) => uri === filterUri)) : tracked;
+      const body = formatDiagnosticLedger(scope, ctx.cwd);
+      const totals = formatFooterStatus(footerState(), ctx.ui.theme) ?? "LSP: nothing analyzed yet";
+
+      if (body === "") {
+        const why = requested
+          ? `no findings tracked for ${requested}`
+          : "no findings tracked — no document is being measured right now";
+        ctx.ui.notify(`${totals}\n${why}`, "info");
+        return;
+      }
+
+      const note = requested ? "\n(the list is filtered to that file; the totals are session-wide)" : "";
+      ctx.ui.notify(`${totals}\n${body}${note}`, "warning");
     },
   });
 

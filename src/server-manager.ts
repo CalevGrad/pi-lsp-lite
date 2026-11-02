@@ -15,7 +15,7 @@ import {
   type CdbResolution,
 } from "./compile-commands.js";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES, DEFAULT_SERVER_IDLE_TIMEOUT } from "./config.js";
-import { DiagnosticSeverity } from "vscode-languageserver-protocol";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -53,6 +53,11 @@ export interface ServerManager {
   status(): ServerStatus[];
   /** Error and warning totals over every live server, for the footer. */
   diagnosticSummary(): DiagnosticSummary;
+  /**
+   * Findings behind those totals: uri -> diagnostics, over every live server. The set shrinks when
+   * a document is closed, so this is "what we measure now", not "what we have ever seen".
+   */
+  getAllDiagnostics(): Map<string, Diagnostic[]>;
   /** Stops running servers (all, or only one id) so the next edit respawns them with current config. */
   restart(id?: string): Promise<number>;
   shutdownAll(): Promise<void>;
@@ -512,6 +517,16 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         () => doEdit(server, filePath),
       );
       server.editQueue = result;
+      return result;
+    },
+
+    getAllDiagnostics(): Map<string, Diagnostic[]> {
+      const result = new Map<string, Diagnostic[]>();
+      for (const server of servers.values()) {
+        for (const [uri, diags] of server.client.getAllDiagnostics()) {
+          result.set(uri, [...diags]);
+        }
+      }
       return result;
     },
 

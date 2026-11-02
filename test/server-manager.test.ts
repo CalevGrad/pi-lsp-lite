@@ -190,6 +190,38 @@ describe("ServerManager", () => {
     assert.deepEqual(manager.diagnosticSummary(), { errors: 0, warnings: 0, files: 0, unavailable: [] });
   });
 
+  it("getAllDiagnostics lists what the footer totals are made of and empties after shutdown", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const fileA = join(dir, "a.go");
+    const fileB = join(dir, "b.go");
+    await writeFile(fileA, "package main");
+    await writeFile(fileB, "package main");
+
+    await manager.handleEdit(fileA, fakeConfig, dir);
+    await manager.handleEdit(fileB, fakeConfig, dir);
+
+    const tracked = manager.getAllDiagnostics();
+    assert.equal(tracked.size, 2);
+    for (const [uri, diags] of tracked) {
+      assert.ok(diags.length > 0, `expected findings for ${uri}`);
+    }
+
+    // The footer reads the same map, so the two can never disagree about what is measured.
+    const counted = [...tracked.values()].flat().filter((d) => d.severity === 1).length;
+    assert.equal(manager.diagnosticSummary().errors, counted);
+
+    // Callers get copies: a renderer that sorts or trims must not corrupt the cache.
+    const first = [...tracked.values()][0];
+    const before = first.length;
+    first.length = 0;
+    assert.equal([...manager.getAllDiagnostics().values()][0].length, before);
+
+    await manager.shutdownAll();
+    assert.equal(manager.getAllDiagnostics().size, 0);
+  });
+
   it("missing binary disables language permanently", async () => {
     const manager = createServerManager();
     const dir = await makeTempDir();

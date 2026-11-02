@@ -70,6 +70,7 @@ all and the footer carries the news alone. `/lsp-status` names the dead server, 
 |---------|-------------|
 | `/lsp-status` | Show running servers, PIDs, workspace roots, uptime, and the argv they run with |
 | `/lsp-log` | Show the extension log — config problems, spawned servers, server stderr (`/lsp-log cpp` to filter, `/lsp-log clear` to empty) |
+| `/lsp-diag` | Show the findings behind the footer totals, file by file (`/lsp-diag <path>` for one file) |
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |

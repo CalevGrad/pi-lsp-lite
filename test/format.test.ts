@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatDiagnostics } from "../src/format.js";
+import { formatDiagnostics, formatDiagnosticLedger } from "../src/format.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import type { DiagnosticResult } from "../src/client.js";
 import { pathToFileURL } from "node:url";
@@ -321,6 +321,61 @@ describe("formatDiagnostics", () => {
       .filter((l) => l.includes("/project/"))
       .map((l) => l.trim().split(" ")[0]);
     assert.deepEqual(order, ["/project/severe.h", "/project/mild.h", "/project/warnings.h"]);
+  });
+});
+
+describe("formatDiagnosticLedger", () => {
+  it("returns empty text when nothing is tracked", () => {
+    assert.equal(formatDiagnosticLedger(new Map(), "/project"), "");
+  });
+
+  it("skips files with nothing but info and hint findings", () => {
+    const map = new Map<string, Diagnostic[]>([
+      ["file:///project/noise.go", [makeDiag(DiagnosticSeverity.Information, "unresolved", 1)]],
+    ]);
+    assert.equal(formatDiagnosticLedger(map, "/project"), "");
+  });
+
+  it("lists the worst file first and errors before warnings inside it", () => {
+    const map = new Map<string, Diagnostic[]>([
+      ["file:///project/mild.go", [makeDiag(DiagnosticSeverity.Warning, "unused import", 3)]],
+      [
+        "file:///project/severe.go",
+        [
+          makeDiag(DiagnosticSeverity.Warning, "later warning", 9),
+          makeDiag(DiagnosticSeverity.Error, "undefined symbol", 2),
+        ],
+      ],
+    ]);
+
+    const output = formatDiagnosticLedger(map, "/project");
+    const headers = output.split("\n").filter((l) => !l.startsWith("  "));
+    assert.deepEqual(
+      headers.map((l) => l.trim()),
+      ["severe.go (1 error, 1 warning):", "mild.go (1 warning):"],
+      output,
+    );
+    assert.ok(output.indexOf("undefined symbol") < output.indexOf("later warning"), output);
+  });
+
+  it("caps rows per file and files per listing", () => {
+    const rows = (count: number) =>
+      Array.from({ length: count }, (_, i) => makeDiag(DiagnosticSeverity.Error, `e${i}`, i));
+
+    const map = new Map<string, Diagnostic[]>();
+    for (let i = 0; i < 25; i++) {
+      map.set(`file:///project/f${String(i).padStart(2, "0")}.go`, rows(15));
+    }
+
+    const crowded = formatDiagnosticLedger(map, "/project");
+    assert.ok(crowded.includes("... and 5 more files with diagnostics"), crowded);
+    assert.equal(crowded.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 200, crowded);
+    assert.equal(crowded.split("\n").filter((l) => l.includes("more in this file")).length, 20, crowded);
+
+    const oneCrowdedFile = new Map<string, Diagnostic[]>([["file:///project/one.go", rows(15)]]);
+    const single = formatDiagnosticLedger(oneCrowdedFile, "/project");
+    assert.ok(single.includes("... and 5 more in this file"), single);
+    assert.equal(single.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 10, single);
   });
 });
 

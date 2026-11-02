@@ -129,3 +129,68 @@ function otherFilesFooter(result: DiagnosticResult, cwd?: string): string {
   const note = hidden > 0 ? `\n  ... and ${hidden} more file${hidden === 1 ? "" : "s"} with diagnostics` : "";
   return `\n${lines.join("\n")}${note}`;
 }
+
+/** Files `/lsp-diag` lists; the rest are counted, not shown. */
+const MAX_LEDGER_FILES = 20;
+/** Diagnostics shown for one file there — a clang-tidy cascade must not fill the whole notice. */
+const MAX_LEDGER_ROWS = 10;
+
+/**
+ * Everything the footer totals are made of: one block per tracked file, errors first, worst file
+ * first. `/lsp-diag` prints it under the footer line so a number in the footer can be checked
+ * against the files it came from.
+ *
+ * Scope is what the servers are measuring now. A file whose document was closed is absent, and its
+ * findings are absent with it — that is not a clean bill, it is no measurement.
+ */
+export function formatDiagnosticLedger(diags: Map<string, Diagnostic[]>, cwd?: string): string {
+  interface LedgerEntry {
+    path: string;
+    errors: number;
+    warnings: number;
+    rows: string[];
+    hidden: number;
+  }
+
+  const entries: LedgerEntry[] = [];
+  for (const [uri, list] of diags) {
+    const relevant = list.filter(
+      (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
+    );
+    if (relevant.length === 0) continue;
+
+    const sorted = [...relevant].sort(bySeverityThenPosition);
+    const errors = sorted.reduce((n, d) => n + (severityRank(d) === 0 ? 1 : 0), 0);
+    const rows = sorted.slice(0, MAX_LEDGER_ROWS).map((d) => {
+      const severity = severityRank(d) === 0 ? "error" : "warning";
+      const source = d.source ? `[${d.source}] ` : "";
+      return `  ${severity} ${d.range.start.line + 1}:${d.range.start.character + 1} ${source}${oneLine(diagnosticMessage(d))}`;
+    });
+
+    entries.push({
+      path: displayPath(uri, cwd),
+      errors,
+      warnings: sorted.length - errors,
+      rows,
+      hidden: sorted.length - rows.length,
+    });
+  }
+
+  if (entries.length === 0) return "";
+
+  entries.sort((a, b) => b.errors - a.errors || b.warnings - a.warnings || a.path.localeCompare(b.path));
+
+  const shown = entries.slice(0, MAX_LEDGER_FILES);
+  const blocks = shown.map((e) => {
+    const counts = [
+      e.errors > 0 ? `${e.errors} error${e.errors > 1 ? "s" : ""}` : "",
+      e.warnings > 0 ? `${e.warnings} warning${e.warnings > 1 ? "s" : ""}` : "",
+    ].filter(Boolean).join(", ");
+    const hidden = e.hidden > 0 ? `\n  ... and ${e.hidden} more in this file` : "";
+    return `${e.path} (${counts}):\n${e.rows.join("\n")}${hidden}`;
+  });
+
+  const hiddenFiles = entries.length - shown.length;
+  const note = hiddenFiles > 0 ? `\n... and ${hiddenFiles} more file${hiddenFiles === 1 ? "" : "s"} with diagnostics` : "";
+  return blocks.join("\n") + note;
+}
