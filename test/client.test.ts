@@ -222,4 +222,91 @@ describe("LspClient", () => {
 
     await client.shutdown();
   });
+
+  it("keeps the last measurement after the document is closed", async () => {
+    const diag = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, message: "test error", severity: 1 };
+    const child = spawnFake({ diagnosticsByUri: { "file:///test/error.ts": [diag] } });
+    const client = createLspClient(child);
+    await client.initialize("/test");
+
+    client.didOpen("file:///test/error.ts", "typescript", "bad code");
+    await client.waitForDiagnostics("file:///test/error.ts", 2000);
+    client.didClose("file:///test/error.ts");
+
+    // Stopping to watch a file does not make it clean. The number stays until something else
+    // measures the file or the file itself goes away.
+    assert.equal(client.getAllDiagnostics().get("file:///test/error.ts")?.length, 1);
+    assert.deepEqual(client.measuredDocuments(), ["file:///test/error.ts"]);
+
+    await client.shutdown();
+  });
+
+  it("forget() drops the measurement of a file that no longer exists", async () => {
+    const diag = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, message: "test error", severity: 1 };
+    const child = spawnFake({ diagnosticsByUri: { "file:///test/error.ts": [diag] } });
+    const client = createLspClient(child);
+    await client.initialize("/test");
+
+    client.didOpen("file:///test/error.ts", "typescript", "bad code");
+    await client.waitForDiagnostics("file:///test/error.ts", 2000);
+    client.didClose("file:///test/error.ts");
+    client.forget("file:///test/error.ts");
+
+    assert.equal(client.getAllDiagnostics().size, 0);
+    assert.deepEqual(client.measuredDocuments(), []);
+
+    await client.shutdown();
+  });
+
+  it("a reopened document keeps its findings when the retained list overflows", async () => {
+    const errA = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, message: "a is broken", severity: 1 };
+    const child = spawnFake({ diagnosticsByUri: { "file:///w/a.cpp": [errA] } });
+    const client = createLspClient(child);
+    await client.initialize("/w");
+    const uri = "file:///w/a.cpp";
+
+    client.didOpen(uri, "cpp", "bad");
+    await client.waitForDiagnostics(uri, 2000);
+    client.didClose(uri);
+    client.didOpen(uri, "cpp", "bad");
+    await client.waitForDiagnostics(uri, 2000);
+
+    // More closes than the retention cap, on other files. An open document must not be evicted as if
+    // it were still closed — that erases the findings of a file we are watching right now, and the
+    // footer drops it until the next edit of that file happens to come along.
+    for (let i = 0; i < 250; i++) {
+      const other = `file:///w/f${i}.cpp`;
+      client.didOpen(other, "cpp", "bad");
+      client.didClose(other);
+    }
+
+    assert.equal(client.getAllDiagnostics().get(uri)?.length, 1, "the reopened document kept its findings");
+    assert.ok(client.measuredDocuments().includes(uri), "and still counts as measured");
+
+    await client.shutdown();
+  });
+
+  it("an unchanged didChange costs one short wait, not a timeout", async () => {
+    const child = spawnFake({ silentOnIdenticalText: true });
+    const client = createLspClient(child);
+    await client.initialize("/test");
+    const uri = "file:///test/main.go";
+
+    client.didOpen(uri, "go", "package main");
+    await client.waitForDiagnostics(uri, 2000);
+
+    const started = Date.now();
+    const result = await client.waitForDiagnostics(uri, 2000); // text untouched: cached answer
+    assert.equal(result.status, "ok");
+    const waited = Date.now() - started;
+    assert.ok(waited < 1000, `expected the cached answer, waited ${waited}ms of the 2000ms budget`);
+
+    // The same text pushed at the server is what makes a server go quiet, and a client that waits
+    // for news that never comes reports the file as having timed out.
+    client.didChange(uri, "package main");
+    const silent = await client.waitForDiagnostics(uri, 300);
+    assert.equal(silent.status, "timeout");
+
+    await client.shutdown();
+  });
 });

@@ -1,13 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isEditToolResult, isWriteToolResult } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
-import { formatDiagnostics } from "./src/format.js";
 import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
-import { which, isInsideCwd } from "./src/util.js";
+import { which, isInsideCwd, fileUri } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
 import { errText, formatLogEntry, log } from "./src/log.js";
-import { formatFooterStatus, type LspHealth } from "./src/footer.js";
+import { formatFooterStatus, type FooterState, type LspHealth } from "./src/footer.js";
+import { formatDiagnostics, formatDiagnosticLedger } from "./src/format.js";
 import { resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
@@ -18,10 +19,14 @@ export default function (pi: ExtensionAPI) {
   let manager = createServerManager({});
   let health: LspHealth = "unknown";
 
+  function footerState(): FooterState {
+    // Measured, not watched: a file the idle sweep stopped watching still holds the only numbers we
+    // have for it, and "nothing analyzed yet" is a different statement from "nothing is wrong".
+    return { ...manager.diagnosticSummary(), checked: manager.measuredDocuments(), health };
+  }
+
   function updateFooter(ctx: ExtensionContext) {
-    const checked = manager.status().reduce((sum, server) => sum + server.openDocuments, 0);
-    const state = { ...manager.diagnosticSummary(), checked, health };
-    ctx.ui.setStatus("lsp", formatFooterStatus(state, ctx.ui.theme));
+    ctx.ui.setStatus("lsp", formatFooterStatus(footerState(), ctx.ui.theme));
   }
 
   function clearFooter(ctx: ExtensionContext) {
@@ -35,7 +40,8 @@ export default function (pi: ExtensionAPI) {
     servers = resolved.servers;
     manager = createServerManager({
       diagnosticTimeout: resolved.diagnosticTimeout,
-      documentIdleTimeout: resolved.documentIdleTimeout,
+      maxOpenDocuments: resolved.maxOpenDocuments,
+      serverIdleTimeout: resolved.serverIdleTimeout,
       perServerTimeout: resolved.perServerTimeout,
     });
 
@@ -61,12 +67,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
+    // Narrow through pi's guards, not our own string comparison over event.toolName: pi names
+    // the tools, so a rename or a reworked result pipeline breaks `npm run check` here instead
+    // of leaving this hook silently matching nothing.
+    if (!isWriteToolResult(event) && !isEditToolResult(event)) return;
+    if (event.isError) return;
 
-    const rawPath = event.input?.path;
+    const rawPath = event.input.path;
     const filePath = typeof rawPath === "string" ? rawPath : undefined;
     if (!filePath) return;
-    if (event.isError) return;
 
     let absolutePath: string;
     try {
@@ -80,7 +89,10 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
-      health = result.status;
+      // "unavailable" is not a measurement, only the news that this edit found no server to
+      // measure with. The summary carries dead servers, so health keeps the state of the last
+      // check that actually ran rather than getting wiped by an edit that ran no check.
+      if (result.status !== "unavailable") health = result.status;
       updateFooter(ctx);
       const formatted = formatDiagnostics(filePath, result, ctx.cwd);
       if (!formatted) return;
@@ -117,7 +129,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(
-        `pi-lsp-lite: stopped ${stopped} server${stopped !== 1 ? "s" : ""} — the next edit respawns them with current config and compile commands`,
+        `pi-lsp-lite: stopped ${stopped} server${stopped !== 1 ? "s" : ""} — the next edit respawns them with current config, PATH, and compile commands`,
         "info",
       );
     },
@@ -148,6 +160,45 @@ export default function (pi: ExtensionAPI) {
       const hidden = matched.length - shown.length;
       const summary = `${shown.length}/${matched.length} entries${query ? ` matching "${query}"` : ""}${hidden > 0 ? `, ${hidden} older hidden` : ""}`;
       ctx.ui.notify([summary, ...shown.map(formatLogEntry)].join("\n"), "warning");
+    },
+  });
+
+  pi.registerCommand("lsp-diag", {
+    description: "Show the findings behind the footer totals, or one file with '/lsp-diag <path>'",
+    handler: async (args, ctx) => {
+      const requested = args?.trim().replace(/^@/, "");
+
+      // Documents are keyed by the realpath'd URI, the same normalization the edit hook applies, or
+      // `/lsp-diag ./x.cpp` would match nothing on a path through a symlink.
+      let filterUri: string | undefined;
+      if (requested) {
+        const absolute = resolve(ctx.cwd, requested);
+        let canonical = absolute;
+        try {
+          canonical = await realpath(absolute);
+        } catch {
+          // the file may be deleted; match the path as typed
+        }
+        filterUri = fileUri(canonical);
+      }
+
+      const tracked = manager.getAllDiagnostics();
+      const scope = filterUri ? new Map([...tracked].filter(([uri]) => uri === filterUri)) : tracked;
+      const body = formatDiagnosticLedger(scope, ctx.cwd);
+      const totals = formatFooterStatus(footerState(), ctx.ui.theme) ?? "LSP: nothing analyzed yet";
+
+      if (body === "") {
+        const why = requested
+          ? `no findings tracked for ${requested}`
+          : footerState().checked === 0
+            ? "nothing has been measured in this session yet — edit a file in a language a server supports"
+            : "the files measured so far came back clean";
+        ctx.ui.notify(`${totals}\n${why}`, "info");
+        return;
+      }
+
+      const note = requested ? "\n(the list is filtered to that file; the totals are session-wide)" : "";
+      ctx.ui.notify(`${totals}\n${body}${note}`, "warning");
     },
   });
 

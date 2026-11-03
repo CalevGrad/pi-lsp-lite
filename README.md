@@ -39,19 +39,30 @@ LSP: 2 errors, 1 warning in 3 files    errors red, warnings yellow
 LSP: 2 errors · timeout                red tail, the counts are a lower bound
 LSP: clean                             no color, nothing left in the analyzed files
 LSP: incomplete                        red, the server timed out, the count may be low
-LSP: server unavailable                red, the binary is missing or failed to start
+LSP: 1 server unavailable              red, a server you edited for is missing or failed to start
+LSP: 3 errors, 1 warning in 2 files · 1 server unavailable    counts stay, the dead one is noted
 ```
 
 The `LSP:` label itself takes the color of the worst severity: red while any error stands, yellow when
-only warnings are left. `incomplete` and `server unavailable` color the whole line red — the number is
+only warnings are left. `incomplete` and a dead-server count color the whole line red — the number is
 unreliable there, so it gets the same attention as an error. `clean` stays plain: nothing to look at.
 When a check times out but issues were found, the same red `· timeout` tail marks the counts as a lower
 bound. It sits after the list, not inside it, because it is a remark about the numbers rather than
 another number.
 
+A server that is down gets that same treatment: it joins the notes after the counts instead of replacing
+them, so a dead `typescript-language-server` never hides what clangd found. It is counted, not named —
+`/lsp-status` says which server, `/lsp-log` says why — because the row has no room for a list of ids.
+Alone, with nothing analyzed yet, it is the whole line.
+
 The count covers the files the servers analyzed in this session — the ones you edited — not the whole
 project. Nothing appears before the first edit, so the footer never calls code clean that it has not
 looked at; after that it keeps the last measurement it made.
+
+A server that is missing or fails to start is the one thing the agent never hears about. A binary it
+cannot install and a server it cannot revive are not things it can act on, so that file gets no report at
+all and the footer carries the news alone. `/lsp-status` names the dead server, `/lsp-log` records why,
+`/lsp-install` fixes what it can.
 
 ## Commands
 
@@ -59,10 +70,11 @@ looked at; after that it keeps the last measurement it made.
 |---------|-------------|
 | `/lsp-status` | Show running servers, PIDs, workspace roots, uptime, and the argv they run with |
 | `/lsp-log` | Show the extension log — config problems, spawned servers, server stderr (`/lsp-log cpp` to filter, `/lsp-log clear` to empty) |
+| `/lsp-diag` | Show the findings behind the footer totals, file by file (`/lsp-diag <path>` for one file) |
 | `/lsp-add` | Interactively add a new language server |
 | `/lsp-remove` | Disable a configured server |
 | `/lsp-toggle` | Flip a server on/off without removing config |
-| `/lsp-restart` | Restart a running server (`/lsp-restart cpp`) so it re-reads config and compile commands |
+| `/lsp-restart` | Restart a running server (`/lsp-restart cpp`) so it re-reads config, PATH, and compile commands |
 | `/lsp-install` | Install a missing server binary |
 
 ## Supported servers
@@ -97,15 +109,15 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | Field | Description | Default |
 |-------|-------------|---------|
 | `servers.<id>.diagnosticTimeout` | Per-attempt timeout (ms) | per-language |
-| `servers.<id>.maxRetries` | Retry attempts on timeout (0-10) | `3` |
 | `servers.<id>.disabled` | Disable this server | `false` |
 | `servers.<id>.cdbAutoDiscover` | Find a compilation database clangd cannot see (C/C++) | `true` for `cpp` |
 | `servers.<id>.cdbGlobs` | Where to look, relative to the workspace root | `["build/**/compile_commands.json"]` |
 | `servers.<id>.cdbMaxDepth` | How deep to look, in path segments (1-8) | `3` |
 | `diagnosticTimeout` | Global default timeout (ms) | `5000` |
-| `documentIdleTimeout` | Close idle documents after (ms) | `120000` |
+| `maxOpenDocuments` | Documents one server holds open at once (5-200); the oldest are closed, their findings stay in the report | `15` |
+| `serverIdleTimeout` | Stop an unused server after (ms); `0` never stops one | `1800000` |
 
-Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
+Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
 
 ### C/C++: finding compile_commands.json
 
@@ -153,19 +165,46 @@ Notes:
 1. Agent writes/edits a file
 2. Extension detects the language, finds the workspace root
 3. Spawns (or reuses) an LSP server for that language + root
-4. Sends `didChange`, waits for `publishDiagnostics`
-5. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
-6. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
+4. Skips the check if the file holds the exact text the server already has
+5. Pushes the disk text of any open document an outside tool rewrote
+6. Sends `didChange`, waits for `publishDiagnostics`
+7. If the window expires: report `timeout`. The text is sent once, never re-sent
+8. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
 Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
-that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`.
+that file too — `src/caller.ts (1 error): error 10:5 undefined: baz`. This works only for files the server
+speaks about on its own. The extension does not look up who uses the code you changed, so when no other
+file was reported the end of the report says `dependents: not checked (only files the server mentioned
+were compared)` rather than leaving an empty list to be read as "nothing else is affected".
+
+A file we hold open can also change without us: `git checkout`, `sed -i`, a formatter run by hand or
+through bash. Before each check the extension compares the open files against the disk and pushes the
+current text of every one whose content no longer matches what the server was given — otherwise the
+server keeps parsing our old copy and reports real errors on wrong lines. A rewrite that changed nothing
+(a checkout of the same commit) only refreshes the timestamp. `/lsp-log` records what was re-sent. A file
+that was deleted is closed and its numbers are dropped, since they describe nothing.
+
+The other case is a write of the same text — an agent rewriting a file it just wrote. The server holds
+that text already and answers it with silence, because the answer did not change. Sending it anyway used
+to throw away the cached errors and end in a timeout after every wait window: minutes of waiting and a
+report saying the file is clean.
 
 The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
 for other files, errors first, one line per diagnostic — long clangd template errors fold into one line.
 The summary above them still counts everything, so `137 errors` and `... and 117 more diagnostics in this
 file` appear in the same report.
 
-Servers are lazy (spawn on first edit), idle-shutdown after 240s, and clean up on session end.
+Servers are lazy (spawn on first edit), stop after 30 minutes without edits (`serverIdleTimeout`; set it to
+`0` to keep them for the whole session), and clean up on session end. The timeout is long because a
+reading or review gap is normal, and a stopped server makes the next edit wait for a fresh start —
+which arrives in the report as a timeout.
+
+A server also holds a limited number of documents open (`maxOpenDocuments`, 15 by default): past that
+the least recently used are closed. The limit is a count, not a timer, because closing documents gives
+clangd back only part of the memory — 40 heavy C++ translation units took 1797 MB and closing all of
+them returned 574 MB of it — while the peak lands in a burst of edits, where no timer can reach.
+Stopping the server is what actually returns memory. A closed document keeps its last measurement, so
+the footer and `/lsp-diag` still name that file; it just says the numbers are the last ones taken.
 
 ## Development
 

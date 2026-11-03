@@ -1,4 +1,5 @@
 import { type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import spawn from "cross-spawn";
 import { which, fileUri, findWorkspaceRoot } from "./util.js";
 import { errText, log } from "./log.js";
@@ -14,9 +15,25 @@ import {
   type AppliedCdb,
   type CdbResolution,
 } from "./compile-commands.js";
-import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
-import { DiagnosticSeverity } from "vscode-languageserver-protocol";
+import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_MAX_OPEN_DOCUMENTS, DEFAULT_SERVER_IDLE_TIMEOUT } from "./config.js";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { readFile, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+/** What the server was last given for a document, as recorded on disk. */
+interface DocumentStamp {
+  mtimeMs: number;
+  size: number;
+  /**
+   * Hash of the exact text sent to the server. mtime and size cannot answer "did the text change":
+   * a rewrite with identical content moves mtime and changes nothing else.
+   */
+  textHash: string;
+}
+
+interface OpenDocument extends DocumentStamp {
+  lastActivity: number;
+}
 
 interface ManagedServer {
   config: LanguageServerConfig;
@@ -24,7 +41,7 @@ interface ManagedServer {
   root: string;
   process: ChildProcess;
   client: LspClient;
-  openDocuments: Map<string, number>;
+  openDocuments: Map<string, OpenDocument>;
   idleTimer: ReturnType<typeof setTimeout> | null;
   startTime: number;
   lastActivity: number;
@@ -37,11 +54,25 @@ interface ManagedServer {
   cdbFile: string | null;
 }
 
+/** Findings for one file, plus whether a live server still watches it. */
+export interface FileFindings {
+  diagnostics: Diagnostic[];
+  watched: boolean;
+}
+
 export interface ServerManager {
   handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult>;
   status(): ServerStatus[];
   /** Error and warning totals over every live server, for the footer. */
   diagnosticSummary(): DiagnosticSummary;
+  /**
+   * Findings behind those totals: uri -> diagnostics and whether the file is still watched. Kept
+   * when a document closes, because a file we stopped watching is not a clean file. Dropped when the
+   * file is deleted or its server dies.
+   */
+  getAllDiagnostics(): Map<string, FileFindings>;
+  /** Documents at least one answer arrived for, watched or not. Zero means nothing was measured. */
+  measuredDocuments(): number;
   /** Stops running servers (all, or only one id) so the next edit respawns them with current config. */
   restart(id?: string): Promise<number>;
   shutdownAll(): Promise<void>;
@@ -52,6 +83,12 @@ export interface DiagnosticSummary {
   warnings: number;
   /** Files holding at least one error or warning. */
   files: number;
+  /**
+   * Ids of servers an edit reached but could not use: no binary on PATH, or `initialize` failed
+   * for that root. Only languages that were actually edited appear — the footer must not
+   * announce a dead server for a language nobody touched this session.
+   */
+  unavailable: string[];
 }
 
 export interface ServerStatus {
@@ -65,9 +102,7 @@ export interface ServerStatus {
   args: string[];
 }
 
-const IDLE_TIMEOUT_MS = 240_000;
 const INIT_TIMEOUT_MS = 10_000;
-const SWEEP_INTERVAL_MS = 60_000;
 // Matches clangd's own RevalidateMissingAfter: how often we re-probe the
 // filesystem for a compilation database that was not there last time.
 const CDB_REVALIDATE_MS = 30_000;
@@ -77,19 +112,29 @@ const MAX_CDB_CACHE_ENTRIES = 256;
 
 export interface ServerManagerOptions {
   diagnosticTimeout?: number;
-  documentIdleTimeout?: number;
+  /** Documents one server may hold open at once; the oldest are closed past this. */
+  maxOpenDocuments?: number;
+  /** Milliseconds without edits before a server is stopped. 0 stops never. */
+  serverIdleTimeout?: number;
   perServerTimeout?: Map<string, number>;
-  maxRetries?: number;
 }
 
-const RETRY_BASE_DELAY_MS = 500;
-const MAX_RETRY_DELAY_MS = 30_000;
+/**
+ * How long to wait when the text did not change. The answer is already cached, so this only covers
+ * the quiescence window; a server with nothing new to say stays silent however long we wait.
+ */
+const UNCHANGED_TEXT_WAIT_MS = 1_000;
+
+/** Identity of a document's text. mtime and size cannot tell a rewrite from a no-op. */
+function hashText(text: string): string {
+  return createHash("sha1").update(text, "utf8").digest("base64");
+}
 
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
   const diagnosticTimeout = options.diagnosticTimeout ?? DEFAULT_DIAGNOSTIC_TIMEOUT;
-  const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  const maxOpenDocuments = options.maxOpenDocuments ?? DEFAULT_MAX_OPEN_DOCUMENTS;
+  const serverIdleTimeout = options.serverIdleTimeout ?? DEFAULT_SERVER_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
-  const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, Promise<ManagedServer | null>>();
   const disabledBinaries = new Set<string>();
@@ -97,35 +142,35 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const cdbCache = new Map<string, { resolution: CdbResolution; expiresAt: number }>();
   const cdbAnnounced = new Set<string>();
   const cdbRestarts = new Map<string, number>();
-  let sweepTimer: ReturnType<typeof setInterval> | null = null;
-
-  function startSweepTimer() {
-    if (sweepTimer) return;
-    sweepTimer = setInterval(() => {
-      const now = Date.now();
-      for (const server of servers.values()) {
-        const stale = [...server.openDocuments.entries()]
-          .filter(([, lastActive]) => now - lastActive > documentIdleTimeout);
-        for (const [docUri] of stale) {
-          server.client.didClose(docUri);
-          server.openDocuments.delete(docUri);
-        }
+  /**
+   * Keep the open set inside `maxOpenDocuments`: close the least recently used documents, so the
+   * server forgets their text. Their findings stay with us — a file the server let go of is not a
+   * clean file, it is a file we no longer measure, and `/lsp-diag` says so.
+   *
+   * By count rather than by time: closing hands clangd back only part of the memory, and the peak
+   * lands in a burst of edits, where no timer can reach.
+   */
+  function evictOverflowDocuments(server: ManagedServer, keepUri: string) {
+    while (server.openDocuments.size > maxOpenDocuments) {
+      let victim: string | null = null;
+      let oldest = Infinity;
+      for (const [uri, doc] of server.openDocuments) {
+        if (uri === keepUri || doc.lastActivity >= oldest) continue;
+        victim = uri;
+        oldest = doc.lastActivity;
       }
-    }, SWEEP_INTERVAL_MS);
-    sweepTimer.unref();
-  }
-
-  function stopSweepTimer() {
-    if (sweepTimer) {
-      clearInterval(sweepTimer);
-      sweepTimer = null;
+      if (victim === null) return; // only the file being edited is left; the limit cannot go lower
+      server.client.didClose(victim);
+      server.openDocuments.delete(victim);
+      log.info(server.config.id, `closed a document to stay within the ${maxOpenDocuments}-document limit`);
     }
   }
 
   function resetIdleTimer(server: ManagedServer) {
     if (server.idleTimer) clearTimeout(server.idleTimer);
     server.lastActivity = Date.now();
-    server.idleTimer = setTimeout(() => shutdownServer(server), IDLE_TIMEOUT_MS);
+    if (serverIdleTimeout === 0) return;
+    server.idleTimer = setTimeout(() => shutdownServer(server), serverIdleTimeout);
   }
 
   async function killProcess(proc: ChildProcess): Promise<void> {
@@ -153,7 +198,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (servers.get(server.serverKey) === server) {
       servers.delete(server.serverKey);
     }
-    if (servers.size === 0) stopSweepTimer();
   }
 
   async function spawnServer(
@@ -218,7 +262,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       cdbFile: resolution.chosen?.file ?? null,
       startTime: now,
       lastActivity: now,
-      editQueue: Promise.resolve({ status: "ok", diagnostics: [], otherFiles: [], retryAttempts: 0 }),
+      editQueue: Promise.resolve({ status: "ok", diagnostics: [], otherFiles: [] }),
     };
 
     child.on("exit", () => {
@@ -226,12 +270,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       if (servers.get(serverKey) === server) {
         servers.delete(serverKey);
       }
-      if (servers.size === 0) stopSweepTimer();
     });
 
     resetIdleTimer(server);
     servers.set(serverKey, server);
-    startSweepTimer();
     return server;
   }
 
@@ -391,10 +433,79 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return spawnOnce(applied.config, root, serverKey, applied.resolution);
   }
 
-  function getMaxRetries(config: LanguageServerConfig): number {
-    const raw = config.maxRetries ?? defaultMaxRetries;
-    if (typeof raw !== "number" || !Number.isFinite(raw)) return defaultMaxRetries;
-    return Math.max(0, Math.min(10, Math.floor(raw)));
+  /** mtime and size of a file, or null when it is no longer on disk. */
+  async function diskStamp(filePath: string): Promise<{ mtimeMs: number; size: number } | null> {
+    try {
+      const info = await stat(filePath);
+      return { mtimeMs: info.mtimeMs, size: info.size };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Stop trusting documents the disk changed under. Anything can rewrite a file between our
+   * edits — `git checkout`, `sed -i`, a formatter run — and until the server hears about it it
+   * keeps parsing the text we sent: line numbers drift, and diagnostics that no longer exist keep
+   * coming back. The fix is the disk text, pushed as a change, so the file stays under observation.
+   *
+   * The file being edited is skipped: its current text is sent a few lines later anyway.
+   */
+  async function syncExternallyChangedDocuments(server: ManagedServer, editedUri: string): Promise<void> {
+    const resynced: string[] = [];
+    const closed: string[] = [];
+
+    for (const [uri, doc] of server.openDocuments) {
+      if (uri === editedUri) continue;
+      let filePath: string;
+      try {
+        filePath = fileURLToPath(uri);
+      } catch {
+        continue; // not a local path we can judge
+      }
+
+      const stamp = await diskStamp(filePath);
+      if (stamp === null) {
+        closed.push(uri);
+        continue;
+      }
+      if (stamp.mtimeMs === doc.mtimeMs && stamp.size === doc.size) continue;
+
+      let text: string;
+      try {
+        text = await readFile(filePath, "utf-8");
+      } catch {
+        continue; // changed, then unreadable — leave it alone and try again next time
+      }
+      const hash = hashText(text);
+      if (hash === doc.textHash) {
+        // Rewritten with the same content: a checkout of the same commit, a formatter that found
+        // nothing to change. Only the stamp is stale; the server still holds the right text.
+        server.openDocuments.set(uri, { ...doc, mtimeMs: stamp.mtimeMs, size: stamp.size });
+        continue;
+      }
+
+      server.client.didChange(uri, text);
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash: hash });
+      resynced.push(uri);
+    }
+
+    for (const uri of closed) {
+      // The file is gone, so its last measurement describes nothing: drop it along with the document.
+      server.client.forget(uri);
+      server.client.didClose(uri);
+      server.openDocuments.delete(uri);
+    }
+
+    if (resynced.length > 0) {
+      log.info(
+        server.config.id,
+        `re-sent ${resynced.length} document${resynced.length === 1 ? "" : "s"} rewritten outside the editor`,
+      );
+    }
+    if (closed.length > 0) {
+      log.info(server.config.id, `closed ${closed.length} document${closed.length === 1 ? "" : "s"} deleted outside the editor`);
+    }
   }
 
   async function doEdit(server: ManagedServer, filePath: string): Promise<DiagnosticResult> {
@@ -402,43 +513,41 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     const uri = fileUri(filePath);
     const content = await readFile(filePath, "utf-8");
+    const textHash = hashText(content);
+    const stamp = (await diskStamp(filePath)) ?? { mtimeMs: 0, size: content.length };
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
-    const retries = getMaxRetries(server.config);
 
-    if (server.openDocuments.has(uri)) {
+    await syncExternallyChangedDocuments(server, uri);
+    const held = server.openDocuments.get(uri);
+
+    // The server already holds this exact text. Sending it again would wipe our cached answer, and a
+    // server with nothing new to say sends nothing — the wait would end in a timeout and the file
+    // would be reported as clean. An agent re-writing a file it just wrote hits this every time.
+    if (held && held.textHash === textHash) {
+      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
+      evictOverflowDocuments(server, uri);
+      return await server.client.waitForDiagnostics(uri, UNCHANGED_TEXT_WAIT_MS);
+    }
+
+    if (held) {
       server.client.didChange(uri, content);
     } else {
       server.client.didOpen(uri, languageIdForFile(filePath, server.config), content);
     }
-    server.openDocuments.set(uri, Date.now());
+    server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
+    evictOverflowDocuments(server, uri);
 
-    let lastResult = await server.client.waitForDiagnostics(uri, timeout);
-
-    for (let attempt = 0; attempt < retries && lastResult.status === "timeout"; attempt++) {
-      resetIdleTimer(server);
-      const baseDelay = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
-      const jitter = baseDelay * Math.random() * 0.5;
-      await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
-
-      server.client.didChange(uri, content);
-      server.openDocuments.set(uri, Date.now());
-      const result = await server.client.waitForDiagnostics(uri, timeout);
-      result.retryAttempts = attempt + 1;
-
-      if (result.status === "ok") {
-        return result;
-      }
-      lastResult = result;
-    }
-
-    return lastResult;
+    // One send, one wait. We do not send the text again while waiting: the server holds it, and a
+    // second notification would wipe an answer that arrived just after the window closed and restart
+    // the analysis whose result we are waiting for. Silence is the answer we report.
+    return await server.client.waitForDiagnostics(uri, timeout);
   }
 
   return {
     async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
       const server = await ensureServer(config, root, filePath, cwd);
-      if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };
+      if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [] };
 
       // serialize edits per server to avoid concurrent waitForDiagnostics races
       const result = server.editQueue.then(
@@ -447,6 +556,26 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       );
       server.editQueue = result;
       return result;
+    },
+
+    getAllDiagnostics(): Map<string, FileFindings> {
+      const result = new Map<string, FileFindings>();
+      for (const server of servers.values()) {
+        if (!server.client) continue;
+        for (const [uri, diags] of server.client.getAllDiagnostics()) {
+          result.set(uri, { diagnostics: [...diags], watched: server.openDocuments.has(uri) });
+        }
+      }
+      return result;
+    },
+
+    measuredDocuments(): number {
+      let count = 0;
+      for (const server of servers.values()) {
+        if (!server.client) continue;
+        count += server.client.measuredDocuments().length;
+      }
+      return count;
     },
 
     status(): ServerStatus[] {
@@ -478,7 +607,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
           warnings += fileWarnings;
         }
       }
-      return { errors, warnings, files };
+      const dead = new Set(disabledBinaries);
+      for (const key of failedRoots) dead.add(key.slice(0, key.indexOf(":")));
+
+      return { errors, warnings, files, unavailable: [...dead].sort() };
     },
 
     async restart(id?: string): Promise<number> {
@@ -496,13 +628,18 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       for (const key of [...failedRoots]) {
         if (!id || key.startsWith(id + ":")) failedRoots.delete(key);
       }
+      // A binary installed by hand since the last attempt is also the filesystem changing, so
+      // the PATH blacklist goes the same way. Keeping it would hold the footer on "server
+      // unavailable" for a server that is now healthy.
+      for (const key of [...disabledBinaries]) {
+        if (!id || key === id) disabledBinaries.delete(key);
+      }
 
       await Promise.allSettled(targets.map((s) => shutdownServer(s)));
       return targets.length;
     },
 
     async shutdownAll() {
-      stopSweepTimer();
       const shutdowns = Array.from(servers.values()).map((s) => shutdownServer(s));
       await Promise.allSettled(shutdowns);
     },

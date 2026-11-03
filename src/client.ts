@@ -28,7 +28,6 @@ export interface DiagnosticResult {
   status: "ok" | "timeout" | "unavailable";
   diagnostics: Diagnostic[];
   otherFiles: OtherFileDiagnostics[];
-  retryAttempts: number;
 }
 
 export interface LspClient {
@@ -36,6 +35,13 @@ export interface LspClient {
   didOpen(uri: string, languageId: string, content: string): void;
   didChange(uri: string, content: string): void;
   didClose(uri: string): void;
+  /**
+   * Drop the last measurement for a URI entirely. Used when the file itself is gone, so the
+   * numbers describe nothing; closing a document that still exists keeps the measurement.
+   */
+  forget(uri: string): void;
+  /** URIs this client has received a publishDiagnostics for and has not since re-sent. */
+  measuredDocuments(): string[];
   waitForDiagnostics(uri: string, timeoutMs: number): Promise<DiagnosticResult>;
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdown(): Promise<void>;
@@ -43,6 +49,12 @@ export interface LspClient {
 
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 const QUIESCENCE_MS = 200;
+/**
+ * How many closed documents keep their last measurement before the oldest is dropped. Far above the
+ * open-document limit on purpose: closing a document to stay within that limit must not remove a
+ * file from the report.
+ */
+const MAX_RETAINED_CLOSED_MEASUREMENTS = 200;
 
 function countDiagnostics(diags: Diagnostic[]): { errors: number; warnings: number } {
   let errors = 0;
@@ -101,6 +113,24 @@ export function createLspClient(child: ChildProcess): LspClient {
   const diagnosticsMap = new Map<string, DiagnosticEntry>();
   const documentVersion = new Map<string, number>();
   const uriGeneration = new Map<string, number>();
+  /**
+   * URIs whose document was closed while their measurement was kept, oldest first. Bounds the
+   * retained set: a long session that touched thousands of files should not accumulate forever.
+   */
+  const retainedClosed = new Map<string, number>();
+  let closeSequence = 0;
+
+  const retainClosedMeasurement = (uri: string) => {
+    retainedClosed.delete(uri);
+    retainedClosed.set(uri, ++closeSequence);
+    while (retainedClosed.size > MAX_RETAINED_CLOSED_MEASUREMENTS) {
+      const oldest = retainedClosed.keys().next().value as string;
+      retainedClosed.delete(oldest);
+      diagnosticsMap.delete(oldest);
+      documentVersion.delete(oldest);
+      uriGeneration.delete(oldest);
+    }
+  };
   let crossFileCallback: ((changedUri: string) => void) | null = null;
 
   connection.onNotification(PublishDiagnosticsNotification.type, (params) => {
@@ -146,6 +176,9 @@ export function createLspClient(child: ChildProcess): LspClient {
     },
 
     didOpen(uri: string, languageId: string, content: string) {
+      // No longer a closed document: it must stop competing for the retention cap, or an overflow
+      // would evict the findings of a file that is open and being watched.
+      retainedClosed.delete(uri);
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
       uriGeneration.set(uri, gen);
       documentVersion.set(uri, 1);
@@ -173,8 +206,26 @@ export function createLspClient(child: ChildProcess): LspClient {
       connection.sendNotification(DidCloseTextDocumentNotification.type, {
         textDocument: { uri },
       });
+      // The measurement outlives the document. A file we stopped watching does not become clean,
+      // and a report that drops it reads as "nothing wrong here" — which is the opposite of true.
+      // The caller's set of open documents is what says "no longer watched", not this map.
+      if (diagnosticsMap.has(uri)) retainClosedMeasurement(uri);
+      documentVersion.delete(uri);
+    },
+
+    forget(uri: string) {
+      retainedClosed.delete(uri);
       diagnosticsMap.delete(uri);
       documentVersion.delete(uri);
+      uriGeneration.delete(uri);
+    },
+
+    measuredDocuments() {
+      const uris: string[] = [];
+      for (const [uri, entry] of diagnosticsMap) {
+        if (entry.received) uris.push(uri);
+      }
+      return uris;
     },
 
     async waitForDiagnostics(uri: string, timeoutMs: number): Promise<DiagnosticResult> {
@@ -229,7 +280,6 @@ export function createLspClient(child: ChildProcess): LspClient {
             status,
             diagnostics: diagnosticsMap.get(uri)?.diagnostics ?? [],
             otherFiles: collectOtherFiles(),
-            retryAttempts: 0,
           });
         };
 

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatDiagnostics } from "../src/format.js";
+import { formatDiagnostics, formatDiagnosticLedger, type LedgerFile } from "../src/format.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import type { DiagnosticResult } from "../src/client.js";
 import { pathToFileURL } from "node:url";
@@ -23,7 +23,6 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Warning, "unused import", 1, 0),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -40,11 +39,34 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
     assert.equal(output, "");
+  });
+
+  it("says dependents were not checked when the server mentioned no other file", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
+      otherFiles: [],
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.includes("undefined variable"));
+    assert.ok(output.includes("dependents: not checked"));
+  });
+
+  it("does not add the dependents note when the server did report another file", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
+      otherFiles: [{ uri: "file:///project/caller.go", errorCount: 1, warningCount: 0 }],
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.includes("caller.go"));
+    assert.ok(!output.includes("dependents: not checked"));
   });
 
   it("returns timeout message for timeout with no diagnostics", () => {
@@ -52,7 +74,6 @@ describe("formatDiagnostics", () => {
       status: "timeout",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -65,7 +86,6 @@ describe("formatDiagnostics", () => {
       status: "timeout",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "some error")],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -92,7 +112,6 @@ describe("formatDiagnostics", () => {
           firstDiagnostic: { severity: DiagnosticSeverity.Warning, line: 0, col: 0, message: "unused import", source: "compiler" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -112,7 +131,6 @@ describe("formatDiagnostics", () => {
           firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result, "/project");
@@ -124,7 +142,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [],
       otherFiles: [{ uri: "file:///project/other.go", errorCount: 1, warningCount: 0 }],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -139,51 +156,34 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Hint, "hint message"),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
     assert.equal(output, "");
   });
 
-  it("includes retry count in timeout message when retryAttempts > 0", () => {
-    const result: DiagnosticResult = {
-      status: "timeout",
-      diagnostics: [makeDiag(DiagnosticSeverity.Error, "some error")],
-      otherFiles: [],
-      retryAttempts: 3,
-    };
-
-    const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("after 3 retries"), `expected 'after 3 retries' in: ${output}`);
-    assert.ok(output.includes("timed out"));
-    assert.ok(output.includes("may be incomplete"));
-  });
-
-  it("uses singular 'retry' when retryAttempts is 1", () => {
+  it("marks a silent timeout as incomplete", () => {
     const result: DiagnosticResult = {
       status: "timeout",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 1,
     };
 
     const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("after 1 retry"), `expected 'after 1 retry' in: ${output}`);
+    assert.ok(output.includes("timed out, may be incomplete"), output);
+    assert.ok(!output.includes("silent waits"), output);
   });
 
-  it("surfaces unavailable status instead of returning empty", () => {
+  it("keeps an unavailable server out of the agent report", () => {
     const result: DiagnosticResult = {
       status: "unavailable",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
-    const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("unavailable"), `expected 'unavailable' in: ${output}`);
-    assert.ok(output.includes("main.go"), `expected file path in: ${output}`);
-    assert.ok(output.includes("server missing or failed to start"), `expected reason in: ${output}`);
+    // The footer carries this state; a report would only tell the agent about a server it
+    // cannot install or restart, on every edit.
+    assert.equal(formatDiagnostics("main.go", result), "");
   });
 
   it("truncates diagnostics beyond the line budget with a note", () => {
@@ -194,7 +194,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: diags,
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -213,10 +212,9 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Warning, "sign compare", 4),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
-    const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => l.startsWith("  "));
+    const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => /^  (error|warning) /.test(l));
     assert.deepEqual(lines.map((l) => l.trim().split(" ")[0]), ["error", "warning", "warning"]);
   });
 
@@ -228,7 +226,6 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Error, "early", 3),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -240,11 +237,10 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "no matching function\ncandidate ignored\ntype erased here", 1)],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.cpp", result);
-    assert.equal(output.split("\n").length, 3, `blank + header + one diagnostic line: ${output}`);
+    assert.equal(output.split("\n").length, 4, `blank + header + one diagnostic line + the dependents note: ${output}`);
     assert.ok(output.includes("no matching function candidate ignored type erased here"), output);
   });
 
@@ -253,7 +249,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "x".repeat(500))],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const line = formatDiagnostics("main.cpp", result).split("\n")[2];
@@ -270,7 +265,6 @@ describe("formatDiagnostics", () => {
         errorCount: 1,
         warningCount: 0,
       })),
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.cpp", result);
@@ -288,7 +282,6 @@ describe("formatDiagnostics", () => {
         { uri: "file:///project/severe.h", errorCount: 9, warningCount: 0 },
         { uri: "file:///project/warnings.h", errorCount: 0, warningCount: 4 },
       ],
-      retryAttempts: 0,
     };
 
     const order = formatDiagnostics("main.cpp", result)
@@ -296,6 +289,78 @@ describe("formatDiagnostics", () => {
       .filter((l) => l.includes("/project/"))
       .map((l) => l.trim().split(" ")[0]);
     assert.deepEqual(order, ["/project/severe.h", "/project/mild.h", "/project/warnings.h"]);
+  });
+});
+
+describe("formatDiagnosticLedger", () => {
+  const watched = (diagnostics: Diagnostic[]): LedgerFile => ({ diagnostics, watched: true });
+
+  it("returns empty text when nothing is tracked", () => {
+    assert.equal(formatDiagnosticLedger(new Map(), "/project"), "");
+  });
+
+  it("skips files with nothing but info and hint findings", () => {
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/noise.go", watched([makeDiag(DiagnosticSeverity.Information, "unresolved", 1)])],
+    ]);
+    assert.equal(formatDiagnosticLedger(map, "/project"), "");
+  });
+
+  it("lists the worst file first and errors before warnings inside it", () => {
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/mild.go", watched([makeDiag(DiagnosticSeverity.Warning, "unused import", 3)])],
+      [
+        "file:///project/severe.go",
+        watched([
+          makeDiag(DiagnosticSeverity.Warning, "later warning", 9),
+          makeDiag(DiagnosticSeverity.Error, "undefined symbol", 2),
+        ]),
+      ],
+    ]);
+
+    const output = formatDiagnosticLedger(map, "/project");
+    const headers = output.split("\n").filter((l) => !l.startsWith("  "));
+    assert.deepEqual(
+      headers.map((l) => l.trim()),
+      ["severe.go (1 error, 1 warning):", "mild.go (1 warning):"],
+      output,
+    );
+    assert.ok(output.indexOf("undefined symbol") < output.indexOf("later warning"), output);
+  });
+
+  it("marks a file that is no longer watched so its numbers read as the last ones taken", () => {
+    const map = new Map<string, LedgerFile>([
+      ["file:///project/live.go", watched([makeDiag(DiagnosticSeverity.Error, "undefined symbol", 1)])],
+      [
+        "file:///project/closed.go",
+        { diagnostics: [makeDiag(DiagnosticSeverity.Error, "stale error", 2)], watched: false },
+      ],
+    ]);
+
+    const output = formatDiagnosticLedger(map, "/project");
+    assert.ok(output.includes("closed.go (1 error, last measurement):"), output);
+    assert.ok(output.includes("live.go (1 error):"), output);
+    assert.ok(output.includes("1 of 2 files are no longer watched"), output);
+  });
+
+  it("caps rows per file and files per listing", () => {
+    const rows = (count: number) =>
+      Array.from({ length: count }, (_, i) => makeDiag(DiagnosticSeverity.Error, `e${i}`, i));
+
+    const map = new Map<string, LedgerFile>();
+    for (let i = 0; i < 25; i++) {
+      map.set(`file:///project/f${String(i).padStart(2, "0")}.go`, watched(rows(15)));
+    }
+
+    const crowded = formatDiagnosticLedger(map, "/project");
+    assert.ok(crowded.includes("... and 5 more files with diagnostics"), crowded);
+    assert.equal(crowded.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 200, crowded);
+    assert.equal(crowded.split("\n").filter((l) => l.includes("more in this file")).length, 20, crowded);
+
+    const oneCrowdedFile = new Map<string, LedgerFile>([["file:///project/one.go", watched(rows(15))]]);
+    const single = formatDiagnosticLedger(oneCrowdedFile, "/project");
+    assert.ok(single.includes("... and 5 more in this file"), single);
+    assert.equal(single.split("\n").filter((l) => /^  (error|warning) /.test(l)).length, 10, single);
   });
 });
 
@@ -312,7 +377,6 @@ describe("formatDiagnostics (Windows)", { skip: process.platform !== "win32" }, 
           firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("src\\main.ts", result, "C:\\project");

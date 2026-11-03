@@ -5,7 +5,6 @@ export interface LanguageServerConfig {
   args: string[];
   rootPatterns: string[];
   diagnosticTimeout?: number;
-  maxRetries?: number;
   languageIds?: Record<string, string>;
   // Compilation database discovery. clangd probes build/ one level deep, so a
   // database at build/<config>/compile_commands.json is invisible to it; when
