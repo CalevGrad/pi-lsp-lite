@@ -12,7 +12,6 @@ export interface ServerConfigOverride {
   args?: string[];
   rootPatterns?: string[];
   diagnosticTimeout?: number;
-  maxRetries?: number;
   disabled?: boolean;
   cdbAutoDiscover?: boolean;
   cdbGlobs?: string[];
@@ -22,21 +21,29 @@ export interface ServerConfigOverride {
 export interface UserConfig {
   servers?: Record<string, ServerConfigOverride>;
   diagnosticTimeout?: number;
-  documentIdleTimeout?: number;
+  maxOpenDocuments?: number;
   serverIdleTimeout?: number;
 }
 
 export interface ResolvedConfig {
   servers: LanguageServerConfig[];
   diagnosticTimeout: number;
-  documentIdleTimeout: number;
+  maxOpenDocuments: number;
   serverIdleTimeout: number;
   perServerTimeout: Map<string, number>;
 }
 
 export const DEFAULT_DIAGNOSTIC_TIMEOUT = 5_000;
-export const DEFAULT_DOCUMENT_IDLE_TIMEOUT = 120_000;
-export const DEFAULT_MAX_RETRIES = 3;
+/**
+ * How many documents one server may hold open at once. The oldest are closed when the set grows
+ * past this, and their findings stay in the cache.
+ *
+ * A count rather than an idle timer: closing a document gives clangd back only part of the memory
+ * (measured: 40 heavy translation units took 1797 MB, closing all of them returned 574 MB of it),
+ * while the peak happens during a burst of edits, where a timer cannot reach. The count bounds what
+ * the set can grow to, and stopping the server is what actually returns memory.
+ */
+export const DEFAULT_MAX_OPEN_DOCUMENTS = 15;
 
 /**
  * How long a server may sit without edits before it is stopped. Generous on purpose: a
@@ -47,12 +54,10 @@ export const DEFAULT_SERVER_IDLE_TIMEOUT = 1_800_000;
 
 const MIN_DIAGNOSTIC_TIMEOUT = 1_000;
 const MAX_DIAGNOSTIC_TIMEOUT = 60_000;
-const MIN_DOCUMENT_IDLE_TIMEOUT = 10_000;
-const MAX_DOCUMENT_IDLE_TIMEOUT = 600_000;
+const MIN_MAX_OPEN_DOCUMENTS = 5;
+const MAX_MAX_OPEN_DOCUMENTS = 200;
 const MIN_SERVER_IDLE_TIMEOUT = 60_000;
 const MAX_SERVER_IDLE_TIMEOUT = 14_400_000;
-const MIN_MAX_RETRIES = 0;
-const MAX_MAX_RETRIES = 10;
 const MIN_CDB_MAX_DEPTH = 1;
 const MAX_CDB_MAX_DEPTH = 8;
 
@@ -117,15 +122,6 @@ function validateOverride(id: string, raw: unknown): ServerConfigOverride | null
       MIN_DIAGNOSTIC_TIMEOUT,
       MAX_DIAGNOSTIC_TIMEOUT,
       DEFAULT_DIAGNOSTIC_TIMEOUT,
-    );
-  }
-
-  if (raw.maxRetries !== undefined) {
-    override.maxRetries = clamp(
-      raw.maxRetries,
-      MIN_MAX_RETRIES,
-      MAX_MAX_RETRIES,
-      DEFAULT_MAX_RETRIES,
     );
   }
 
@@ -253,7 +249,6 @@ function mergeConfigs(
         command: override.command,
         args: override.args ?? [],
         rootPatterns: override.rootPatterns ?? [],
-        ...(override.maxRetries !== undefined && { maxRetries: override.maxRetries }),
         ...(override.cdbAutoDiscover !== undefined && { cdbAutoDiscover: override.cdbAutoDiscover }),
         ...(override.cdbGlobs !== undefined && { cdbGlobs: override.cdbGlobs }),
         ...(override.cdbMaxDepth !== undefined && { cdbMaxDepth: override.cdbMaxDepth }),
@@ -329,7 +324,7 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
   let servers = [...builtinLanguages];
   const perServerTimeout = new Map<string, number>();
   let diagnosticTimeout = DEFAULT_DIAGNOSTIC_TIMEOUT;
-  let documentIdleTimeout = DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  let maxOpenDocuments = DEFAULT_MAX_OPEN_DOCUMENTS;
   let serverIdleTimeout = DEFAULT_SERVER_IDLE_TIMEOUT;
 
   const layers: [UserConfig | null, ConfigSource][] = [
@@ -349,8 +344,8 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
     if (layer.diagnosticTimeout !== undefined) {
       diagnosticTimeout = clamp(layer.diagnosticTimeout, MIN_DIAGNOSTIC_TIMEOUT, MAX_DIAGNOSTIC_TIMEOUT, diagnosticTimeout);
     }
-    if (layer.documentIdleTimeout !== undefined) {
-      documentIdleTimeout = clamp(layer.documentIdleTimeout, MIN_DOCUMENT_IDLE_TIMEOUT, MAX_DOCUMENT_IDLE_TIMEOUT, documentIdleTimeout);
+    if (layer.maxOpenDocuments !== undefined) {
+      maxOpenDocuments = clamp(layer.maxOpenDocuments, MIN_MAX_OPEN_DOCUMENTS, MAX_MAX_OPEN_DOCUMENTS, maxOpenDocuments);
     }
     if (layer.serverIdleTimeout !== undefined) {
       // 0 is a setting, not an out-of-range number: it means "never stop a running server".
@@ -360,5 +355,5 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
     }
   }
 
-  return { servers, diagnosticTimeout, documentIdleTimeout, serverIdleTimeout, perServerTimeout };
+  return { servers, diagnosticTimeout, maxOpenDocuments, serverIdleTimeout, perServerTimeout };
 }

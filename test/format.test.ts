@@ -23,7 +23,6 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Warning, "unused import", 1, 0),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -40,7 +39,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -52,7 +50,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -65,7 +62,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "undefined variable")],
       otherFiles: [{ uri: "file:///project/caller.go", errorCount: 1, warningCount: 0 }],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -78,7 +74,6 @@ describe("formatDiagnostics", () => {
       status: "timeout",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -91,7 +86,6 @@ describe("formatDiagnostics", () => {
       status: "timeout",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "some error")],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -118,7 +112,6 @@ describe("formatDiagnostics", () => {
           firstDiagnostic: { severity: DiagnosticSeverity.Warning, line: 0, col: 0, message: "unused import", source: "compiler" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -138,7 +131,6 @@ describe("formatDiagnostics", () => {
           firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result, "/project");
@@ -150,7 +142,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [],
       otherFiles: [{ uri: "file:///project/other.go", errorCount: 1, warningCount: 0 }],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -165,37 +156,22 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Hint, "hint message"),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
     assert.equal(output, "");
   });
 
-  it("includes retry count in timeout message when retryAttempts > 0", () => {
-    const result: DiagnosticResult = {
-      status: "timeout",
-      diagnostics: [makeDiag(DiagnosticSeverity.Error, "some error")],
-      otherFiles: [],
-      retryAttempts: 3,
-    };
-
-    const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("after 3 retries"), `expected 'after 3 retries' in: ${output}`);
-    assert.ok(output.includes("timed out"));
-    assert.ok(output.includes("may be incomplete"));
-  });
-
-  it("uses singular 'retry' when retryAttempts is 1", () => {
+  it("marks a silent timeout as incomplete", () => {
     const result: DiagnosticResult = {
       status: "timeout",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 1,
     };
 
     const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("after 1 retry"), `expected 'after 1 retry' in: ${output}`);
+    assert.ok(output.includes("timed out, may be incomplete"), output);
+    assert.ok(!output.includes("silent waits"), output);
   });
 
   it("keeps an unavailable server out of the agent report", () => {
@@ -203,7 +179,6 @@ describe("formatDiagnostics", () => {
       status: "unavailable",
       diagnostics: [],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     // The footer carries this state; a report would only tell the agent about a server it
@@ -219,7 +194,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: diags,
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -238,7 +212,6 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Warning, "sign compare", 4),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const lines = formatDiagnostics("main.go", result).split("\n").filter((l) => /^  (error|warning) /.test(l));
@@ -253,7 +226,6 @@ describe("formatDiagnostics", () => {
         makeDiag(DiagnosticSeverity.Error, "early", 3),
       ],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
@@ -265,7 +237,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "no matching function\ncandidate ignored\ntype erased here", 1)],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.cpp", result);
@@ -278,7 +249,6 @@ describe("formatDiagnostics", () => {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "x".repeat(500))],
       otherFiles: [],
-      retryAttempts: 0,
     };
 
     const line = formatDiagnostics("main.cpp", result).split("\n")[2];
@@ -295,7 +265,6 @@ describe("formatDiagnostics", () => {
         errorCount: 1,
         warningCount: 0,
       })),
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.cpp", result);
@@ -313,7 +282,6 @@ describe("formatDiagnostics", () => {
         { uri: "file:///project/severe.h", errorCount: 9, warningCount: 0 },
         { uri: "file:///project/warnings.h", errorCount: 0, warningCount: 4 },
       ],
-      retryAttempts: 0,
     };
 
     const order = formatDiagnostics("main.cpp", result)
@@ -409,7 +377,6 @@ describe("formatDiagnostics (Windows)", { skip: process.platform !== "win32" }, 
           firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
         },
       ],
-      retryAttempts: 0,
     };
 
     const output = formatDiagnostics("src\\main.ts", result, "C:\\project");

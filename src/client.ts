@@ -28,7 +28,6 @@ export interface DiagnosticResult {
   status: "ok" | "timeout" | "unavailable";
   diagnostics: Diagnostic[];
   otherFiles: OtherFileDiagnostics[];
-  retryAttempts: number;
 }
 
 export interface LspClient {
@@ -50,7 +49,11 @@ export interface LspClient {
 
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 const QUIESCENCE_MS = 200;
-/** How many closed documents keep their last measurement before the oldest is dropped. */
+/**
+ * How many closed documents keep their last measurement before the oldest is dropped. Far above the
+ * open-document limit on purpose: closing a document to stay within that limit must not remove a
+ * file from the report.
+ */
 const MAX_RETAINED_CLOSED_MEASUREMENTS = 200;
 
 function countDiagnostics(diags: Diagnostic[]): { errors: number; warnings: number } {
@@ -277,7 +280,6 @@ export function createLspClient(child: ChildProcess): LspClient {
             status,
             diagnostics: diagnosticsMap.get(uri)?.diagnostics ?? [],
             otherFiles: collectOtherFiles(),
-            retryAttempts: 0,
           });
         };
 

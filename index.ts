@@ -40,7 +40,7 @@ export default function (pi: ExtensionAPI) {
     servers = resolved.servers;
     manager = createServerManager({
       diagnosticTimeout: resolved.diagnosticTimeout,
-      documentIdleTimeout: resolved.documentIdleTimeout,
+      maxOpenDocuments: resolved.maxOpenDocuments,
       serverIdleTimeout: resolved.serverIdleTimeout,
       perServerTimeout: resolved.perServerTimeout,
     });

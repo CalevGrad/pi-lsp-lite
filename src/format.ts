@@ -60,10 +60,6 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
   const sorted = [...allRelevant].sort(bySeverityThenPosition);
   const relevant = sorted.slice(0, MAX_TARGET_LINES);
 
-  const retryNote = result.status === "timeout" && result.retryAttempts > 0
-    ? ` after ${result.retryAttempts} ${result.retryAttempts === 1 ? "retry" : "retries"}`
-    : "";
-
   if (relevant.length === 0 && result.status === "ok" && result.otherFiles.length > 0) {
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
@@ -85,7 +81,7 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
   const summary = [
     errorCount > 0 ? `${errorCount} error${errorCount > 1 ? "s" : ""}` : "",
     warnCount > 0 ? `${warnCount} warning${warnCount > 1 ? "s" : ""}` : "",
-    result.status === "timeout" ? `timed out${retryNote}, may be incomplete` : "",
+    result.status === "timeout" ? "timed out, may be incomplete" : "",
   ]
     .filter(Boolean)
     .join(", ");

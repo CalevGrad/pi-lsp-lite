@@ -65,7 +65,7 @@ Diagnostic collection uses a two-trigger approach to handle both direct and cros
 
 **Why compare against the snapshot:** A stale re-publish (server re-confirming existing diagnostics) doesn't change counts relative to the snapshot, so it's ignored. Only genuine impact from the current edit triggers settling. This prevents false positives when the server republishes for unrelated files.
 
-**Timeout fallback:** If neither trigger fires within the per-language timeout (gopls: 5s, rust-analyzer: 30s, typescript: 30s), the wait settles with `status: "timeout"`. The server-manager then retries the edit with exponential backoff (base 500ms × 2^attempt, capped at 30s per delay, plus 0-50% random jitter) up to `maxRetries` times (default 3). If any retry succeeds, that result is returned. If all retries are exhausted, the final timeout result includes `retryAttempts` so the agent/user knows the extension tried. Cross-file data collected up to that point is still included in `otherFiles`.
+**Timeout fallback:** If neither trigger fires within the per-language timeout (gopls: 5s, rust-analyzer: 30s, typescript: 30s), the wait settles with `status: "timeout"` and carries whatever diagnostics had arrived. **The text is sent once.** It is never re-sent while waiting: the server already holds it, and a second `didChange` would wipe an answer that arrived just after the window closed and restart the analysis whose result we are waiting for. Cross-file data collected up to that point is still included in `otherFiles`. A late answer is not chased — it lands in the cache and shows up in the footer and `/lsp-diag`, and the next edit of that file reports it.
 
 ```
 handleEdit(lib.ts):
@@ -107,7 +107,9 @@ Each built-in language server has a default diagnostic timeout calibrated to its
 | pylsp | 15s | Moderate cold start, plugin-dependent analysis speed |
 | clangd | 15s | Fast for single files, slower for projects without compile_commands.json |
 
-Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case total wait for rust-analyzer is 4 × 30s + backoff ≈ 2 minutes. Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout` or per-server `servers.<id>.diagnosticTimeout`).
+Timeouts are one window per edit — rust-analyzer waits at most 30s, clangd 15s. Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout` or per-server `servers.<id>.diagnosticTimeout`).
+
+Nobody in the field re-sends: samfoy/pi-lsp does not wait in the edit hook at all (the agent reads the cache with a tool), @ian-pascoe waits 3 s and remembers the silence for that document version instead of waiting again, trotsky1997 waits 3 s (20 s for Rust and Swift, 30 s for Kotlin) and falls back to pull diagnostics, @piex-dev waits 15 s with an 800 ms settle window and returns what it has with a `timedOut` flag, @signalridge waits 20 s with an 800 ms settle window and falls back to the last published set.
 
 ### C/C++ compilation database discovery
 
@@ -177,7 +179,7 @@ drops the cache and the notices, so the next edit re-reads everything.
 
 - Lazy start on first relevant edit
 - Idle shutdown after `serverIdleTimeout` without edits (default 30 min, `0` disables it). Long on purpose: a stopped server makes the next edit pay a cold start, and that arrives as a `timeout` in the report
-- Periodic 60s sweep closes documents idle > 120s. Closing stops the measurement; it does not erase the last one (see below)
+- Open documents are capped at `maxOpenDocuments` (default 15, range 5-200): past that the least recently used are closed with `didClose`, and their measurements stay (see below). A count rather than a timer on purpose — closing documents hands clangd back only part of the memory (measured: 40 heavy translation units took 1797 MB, closing all of them returned 574 MB of it), and the peak lands in a burst of edits, where no timer can reach. Stopping the server is what actually frees it
 - Session shutdown sends the LSP `shutdown` request (5 s cap), then escalates SIGTERM → SIGKILL with a 2 s grace
 
 ### External file changes
@@ -195,17 +197,20 @@ signal about files a bash command rewrote, and the client declares no watched-fi
 disk stamps stand in for it. The text hash is what makes the comparison honest: mtime and size say a file
 was written, never whether the text differs, and those two answers need different handling.
 
+Only open documents are compared. A file beyond `maxOpenDocuments` is not in the server's hands, so
+nothing refreshes it: its numbers stay the last ones taken until the agent edits that file again.
+
 ### Unchanged text and the life of a measurement
 
 An agent often writes a file back with the text it just read. The server holds that text, re-analyzes, and
 sends nothing — it has no new answer to announce. A client that treats "a `publishDiagnostics` arrived" as
 the only finish line waits for news that never comes, and a wait that started by clearing the cached answer
 ends with the file reported as clean. So `doEdit` compares text hashes first and answers an unchanged write
-from the cache with one short wait, no `didChange`, no retries.
+from the cache with one short wait — no `didChange`, no extra windows.
 
 A measurement outlives the document it came from: `didClose` keeps the entry and `getAllDiagnostics()`
 marks it `watched: false`, because a file we stopped watching is not a clean file. That is what keeps the
-footer showing `LSP: 2 errors` after the idle sweep closed the document, instead of clearing the row and
+footer showing `LSP: 2 errors` after the open-document cap closed it, instead of clearing the row and
 reading as "checked, all fine". `/lsp-diag` marks such files `last measurement` and says how many of the
 listed files are unwatched. Retained measurements are capped at 200 closed documents, oldest dropped
 first, and they die with the server that made them — a restarted clangd has measured nothing. `didOpen`
@@ -230,11 +235,11 @@ Config is loaded in three layers at `session_start`:
 Each layer merges over the previous:
 - New server IDs are added (global config only — project config cannot define new servers for security)
 - Existing server IDs are partially overridden (only specified fields change)
-- Project config can tune safe local behaviour (`disabled`, per-server timeout, `maxRetries`) but cannot override trusted server shape (`command`, `args`, `extensions`, `rootPatterns`) for any existing server
+- Project config can tune safe local behaviour (`disabled`, per-server `diagnosticTimeout`) but cannot override trusted server shape (`command`, `args`, `extensions`, `rootPatterns`) for any existing server
 - Global config owns executable/server-shape changes, including custom servers and command/argv overrides
 - `"disabled": true` removes the server entirely (re-enabling in a later layer requires redefining the full server config)
-- Timeout overrides (`diagnosticTimeout`, `documentIdleTimeout`) cascade from global to per-server
-- Timeout values are clamped to safe bounds
+- Per-server `servers.<id>.diagnosticTimeout` overrides the global default for one server; `diagnosticTimeout`, `maxOpenDocuments` and `serverIdleTimeout` are session-wide
+- All of them are clamped to safe bounds, so a typo in a repository's config cannot make the extension idle forever or wait hours on one file
 
 Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 

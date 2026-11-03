@@ -15,7 +15,7 @@ import {
   type AppliedCdb,
   type CdbResolution,
 } from "./compile-commands.js";
-import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES, DEFAULT_SERVER_IDLE_TIMEOUT } from "./config.js";
+import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_MAX_OPEN_DOCUMENTS, DEFAULT_SERVER_IDLE_TIMEOUT } from "./config.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -103,7 +103,6 @@ export interface ServerStatus {
 }
 
 const INIT_TIMEOUT_MS = 10_000;
-const SWEEP_INTERVAL_MS = 60_000;
 // Matches clangd's own RevalidateMissingAfter: how often we re-probe the
 // filesystem for a compilation database that was not there last time.
 const CDB_REVALIDATE_MS = 30_000;
@@ -113,17 +112,16 @@ const MAX_CDB_CACHE_ENTRIES = 256;
 
 export interface ServerManagerOptions {
   diagnosticTimeout?: number;
-  documentIdleTimeout?: number;
+  /** Documents one server may hold open at once; the oldest are closed past this. */
+  maxOpenDocuments?: number;
   /** Milliseconds without edits before a server is stopped. 0 stops never. */
   serverIdleTimeout?: number;
   perServerTimeout?: Map<string, number>;
-  maxRetries?: number;
 }
 
-const RETRY_BASE_DELAY_MS = 500;
 /**
  * How long to wait when the text did not change. The answer is already cached, so this only covers
- * the quiescence window; no retries, because a server with nothing new to say stays silent.
+ * the quiescence window; a server with nothing new to say stays silent however long we wait.
  */
 const UNCHANGED_TEXT_WAIT_MS = 1_000;
 
@@ -131,14 +129,12 @@ const UNCHANGED_TEXT_WAIT_MS = 1_000;
 function hashText(text: string): string {
   return createHash("sha1").update(text, "utf8").digest("base64");
 }
-const MAX_RETRY_DELAY_MS = 30_000;
 
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
   const diagnosticTimeout = options.diagnosticTimeout ?? DEFAULT_DIAGNOSTIC_TIMEOUT;
-  const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  const maxOpenDocuments = options.maxOpenDocuments ?? DEFAULT_MAX_OPEN_DOCUMENTS;
   const serverIdleTimeout = options.serverIdleTimeout ?? DEFAULT_SERVER_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
-  const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, Promise<ManagedServer | null>>();
   const disabledBinaries = new Set<string>();
@@ -146,28 +142,27 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const cdbCache = new Map<string, { resolution: CdbResolution; expiresAt: number }>();
   const cdbAnnounced = new Set<string>();
   const cdbRestarts = new Map<string, number>();
-  let sweepTimer: ReturnType<typeof setInterval> | null = null;
-
-  function startSweepTimer() {
-    if (sweepTimer) return;
-    sweepTimer = setInterval(() => {
-      const now = Date.now();
-      for (const server of servers.values()) {
-        const stale = [...server.openDocuments.entries()]
-          .filter(([, doc]) => now - doc.lastActivity > documentIdleTimeout);
-        for (const [docUri] of stale) {
-          server.client.didClose(docUri);
-          server.openDocuments.delete(docUri);
-        }
+  /**
+   * Keep the open set inside `maxOpenDocuments`: close the least recently used documents, so the
+   * server forgets their text. Their findings stay with us — a file the server let go of is not a
+   * clean file, it is a file we no longer measure, and `/lsp-diag` says so.
+   *
+   * By count rather than by time: closing hands clangd back only part of the memory, and the peak
+   * lands in a burst of edits, where no timer can reach.
+   */
+  function evictOverflowDocuments(server: ManagedServer, keepUri: string) {
+    while (server.openDocuments.size > maxOpenDocuments) {
+      let victim: string | null = null;
+      let oldest = Infinity;
+      for (const [uri, doc] of server.openDocuments) {
+        if (uri === keepUri || doc.lastActivity >= oldest) continue;
+        victim = uri;
+        oldest = doc.lastActivity;
       }
-    }, SWEEP_INTERVAL_MS);
-    sweepTimer.unref();
-  }
-
-  function stopSweepTimer() {
-    if (sweepTimer) {
-      clearInterval(sweepTimer);
-      sweepTimer = null;
+      if (victim === null) return; // only the file being edited is left; the limit cannot go lower
+      server.client.didClose(victim);
+      server.openDocuments.delete(victim);
+      log.info(server.config.id, `closed a document to stay within the ${maxOpenDocuments}-document limit`);
     }
   }
 
@@ -203,7 +198,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (servers.get(server.serverKey) === server) {
       servers.delete(server.serverKey);
     }
-    if (servers.size === 0) stopSweepTimer();
   }
 
   async function spawnServer(
@@ -268,7 +262,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       cdbFile: resolution.chosen?.file ?? null,
       startTime: now,
       lastActivity: now,
-      editQueue: Promise.resolve({ status: "ok", diagnostics: [], otherFiles: [], retryAttempts: 0 }),
+      editQueue: Promise.resolve({ status: "ok", diagnostics: [], otherFiles: [] }),
     };
 
     child.on("exit", () => {
@@ -276,12 +270,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       if (servers.get(serverKey) === server) {
         servers.delete(serverKey);
       }
-      if (servers.size === 0) stopSweepTimer();
     });
 
     resetIdleTimer(server);
     servers.set(serverKey, server);
-    startSweepTimer();
     return server;
   }
 
@@ -441,12 +433,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return spawnOnce(applied.config, root, serverKey, applied.resolution);
   }
 
-  function getMaxRetries(config: LanguageServerConfig): number {
-    const raw = config.maxRetries ?? defaultMaxRetries;
-    if (typeof raw !== "number" || !Number.isFinite(raw)) return defaultMaxRetries;
-    return Math.max(0, Math.min(10, Math.floor(raw)));
-  }
-
   /** mtime and size of a file, or null when it is no longer on disk. */
   async function diskStamp(filePath: string): Promise<{ mtimeMs: number; size: number } | null> {
     try {
@@ -530,7 +516,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     const textHash = hashText(content);
     const stamp = (await diskStamp(filePath)) ?? { mtimeMs: 0, size: content.length };
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
-    const retries = getMaxRetries(server.config);
 
     await syncExternallyChangedDocuments(server, uri);
     const held = server.openDocuments.get(uri);
@@ -540,6 +525,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     // would be reported as clean. An agent re-writing a file it just wrote hits this every time.
     if (held && held.textHash === textHash) {
       server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
+      evictOverflowDocuments(server, uri);
       return await server.client.waitForDiagnostics(uri, UNCHANGED_TEXT_WAIT_MS);
     }
 
@@ -549,34 +535,19 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       server.client.didOpen(uri, languageIdForFile(filePath, server.config), content);
     }
     server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
+    evictOverflowDocuments(server, uri);
 
-    let lastResult = await server.client.waitForDiagnostics(uri, timeout);
-
-    for (let attempt = 0; attempt < retries && lastResult.status === "timeout"; attempt++) {
-      resetIdleTimer(server);
-      const baseDelay = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
-      const jitter = baseDelay * Math.random() * 0.5;
-      await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
-
-      server.client.didChange(uri, content);
-      server.openDocuments.set(uri, { lastActivity: Date.now(), ...stamp, textHash });
-      const result = await server.client.waitForDiagnostics(uri, timeout);
-      result.retryAttempts = attempt + 1;
-
-      if (result.status === "ok") {
-        return result;
-      }
-      lastResult = result;
-    }
-
-    return lastResult;
+    // One send, one wait. We do not send the text again while waiting: the server holds it, and a
+    // second notification would wipe an answer that arrived just after the window closed and restart
+    // the analysis whose result we are waiting for. Silence is the answer we report.
+    return await server.client.waitForDiagnostics(uri, timeout);
   }
 
   return {
     async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
       const server = await ensureServer(config, root, filePath, cwd);
-      if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };
+      if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [] };
 
       // serialize edits per server to avoid concurrent waitForDiagnostics races
       const result = server.editQueue.then(
@@ -669,7 +640,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     },
 
     async shutdownAll() {
-      stopSweepTimer();
       const shutdowns = Array.from(servers.values()).map((s) => shutdownServer(s));
       await Promise.allSettled(shutdowns);
     },

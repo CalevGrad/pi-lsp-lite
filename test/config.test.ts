@@ -30,21 +30,21 @@ describe("loadConfig", () => {
     assert.ok(config.servers.some((s) => s.id === "rust"));
     assert.ok(config.servers.some((s) => s.id === "typescript"));
     assert.equal(config.diagnosticTimeout, 5000);
-    assert.equal(config.documentIdleTimeout, 120000);
+    assert.equal(config.maxOpenDocuments, 15);
     assert.equal(config.serverIdleTimeout, 1800000);
   });
 
-  it("project config can tune existing server retry behaviour", async () => {
+  it("project config can tune existing server timeouts", async () => {
     const dir = await makeTempDir();
     await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
       servers: {
-        typescript: { maxRetries: 5 },
+        typescript: { diagnosticTimeout: 5000 },
       },
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
     const ts = config.servers.find((s) => s.id === "typescript");
     assert.ok(ts);
-    assert.equal(ts.maxRetries, 5);
+    assert.equal(config.perServerTimeout.get("typescript"), 5000);
     assert.deepEqual(ts.args, ["--stdio"]);
     assert.equal(ts.command, "typescript-language-server");
   });
@@ -54,13 +54,13 @@ describe("loadConfig", () => {
     await mkdir(join(dir, ".pi"), { recursive: true });
     await writeFile(join(dir, ".pi", "lsp-lite.json"), JSON.stringify({
       servers: {
-        go: { maxRetries: 1 },
+        go: { diagnosticTimeout: 1500 },
       },
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
     const go = config.servers.find((s) => s.id === "go");
     assert.ok(go);
-    assert.equal(go.maxRetries, 1);
+    assert.equal(config.perServerTimeout.get("go"), 1500);
     assert.deepEqual(go.args, ["serve"]);
   });
 
@@ -101,7 +101,7 @@ describe("loadConfig", () => {
           args: ["--extra-flag"],
           extensions: [".evil"],
           rootPatterns: ["evil.mod"],
-          maxRetries: 2,
+          diagnosticTimeout: 2000,
         },
       },
     }));
@@ -112,7 +112,7 @@ describe("loadConfig", () => {
     assert.deepEqual(goServer.args, ["serve"], "args override from project config should be ignored");
     assert.deepEqual(goServer.extensions, [".go"], "extensions override from project config should be ignored");
     assert.deepEqual(goServer.rootPatterns, ["go.mod"], "rootPatterns override from project config should be ignored");
-    assert.equal(goServer.maxRetries, 2, "safe tuning fields from project config should still apply");
+    assert.equal(config.perServerTimeout.get("go"), 2000, "safe tuning fields from project config should still apply");
   });
 
   it("global config can define new servers", async () => {
@@ -149,7 +149,7 @@ describe("loadConfig", () => {
     const dir = await makeTempDir();
     await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
       servers: {
-        typescript: { maxRetries: 4 },
+        typescript: { diagnosticTimeout: 4000 },
       },
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
@@ -158,7 +158,7 @@ describe("loadConfig", () => {
     assert.deepEqual(ts.args, ["--stdio"]);
     assert.equal(ts.command, "typescript-language-server");
     assert.deepEqual(ts.extensions, [".ts", ".tsx", ".js", ".jsx"]);
-    assert.equal(ts.maxRetries, 4);
+    assert.equal(config.perServerTimeout.get("typescript"), 4000);
   });
 
   it("skips new server without required fields from global config", async () => {
@@ -223,13 +223,19 @@ describe("loadConfig", () => {
     assert.equal(config.diagnosticTimeout, 5000);
   });
 
-  it("overrides documentIdleTimeout", async () => {
+  it("overrides maxOpenDocuments and clamps it into the allowed range", async () => {
     const dir = await makeTempDir();
     await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
-      documentIdleTimeout: 60000,
+      maxOpenDocuments: 30,
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
-    assert.equal(config.documentIdleTimeout, 60000);
+    assert.equal(config.maxOpenDocuments, 30);
+
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      maxOpenDocuments: 1,
+    }));
+    const clamped = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(clamped.maxOpenDocuments, 5, "below the minimum: a server needs a handful of documents to be useful");
   });
 
   it("overrides serverIdleTimeout", async () => {
@@ -328,57 +334,6 @@ describe("loadConfig", () => {
     assert.ok(!config.servers.some((s) => s.id === "bad"));
   });
 
-  it("maxRetries passes through to server config", async () => {
-    const dir = await makeTempDir();
-    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
-      servers: {
-        go: { maxRetries: 5 },
-      },
-    }));
-    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
-    const go = config.servers.find((s) => s.id === "go");
-    assert.ok(go);
-    assert.equal(go.maxRetries, 5);
-  });
-
-  it("clamps maxRetries to maximum of 10", async () => {
-    const dir = await makeTempDir();
-    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
-      servers: {
-        go: { maxRetries: 999 },
-      },
-    }));
-    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
-    const go = config.servers.find((s) => s.id === "go");
-    assert.ok(go);
-    assert.equal(go.maxRetries, 10);
-  });
-
-  it("clamps maxRetries to minimum of 0", async () => {
-    const dir = await makeTempDir();
-    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
-      servers: {
-        go: { maxRetries: -5 },
-      },
-    }));
-    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
-    const go = config.servers.find((s) => s.id === "go");
-    assert.ok(go);
-    assert.equal(go.maxRetries, 0);
-  });
-
-  it("non-numeric maxRetries falls back to default of 3", async () => {
-    const dir = await makeTempDir();
-    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
-      servers: {
-        go: { maxRetries: "many" },
-      },
-    }));
-    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
-    const go = config.servers.find((s) => s.id === "go");
-    assert.ok(go);
-    assert.equal(go.maxRetries, 3);
-  });
 });
 
 describe("compile command discovery config", () => {

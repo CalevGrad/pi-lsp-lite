@@ -19,7 +19,7 @@ describe("clangd integration", { skip: !process.env.INTEGRATION }, () => {
   let dir: string;
 
   before(async () => {
-    manager = createServerManager({ maxRetries: 0 });
+    manager = createServerManager({});
     dir = join(tmpdir(), `pi-lsp-cpp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "compile_commands.json"), JSON.stringify([
@@ -71,7 +71,7 @@ describe("clangd integration with a nested compilation database", { skip: !proce
   let mainPath: string;
 
   before(async () => {
-    manager = createServerManager({ maxRetries: 0 });
+    manager = createServerManager({});
     dir = join(tmpdir(), `pi-lsp-cpp-nested-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     const includeDir = join(dir, "include");
     const srcDir = join(dir, "src");
@@ -102,7 +102,7 @@ describe("clangd integration with a nested compilation database", { skip: !proce
   });
 
   it("proves the layout really is invisible to clangd without discovery", async () => {
-    const plain = createServerManager({ maxRetries: 0 });
+    const plain = createServerManager({});
     const withoutDiscovery = { ...cppConfig, id: "cpp-plain", cdbAutoDiscover: false };
 
     const result = await pollUntil(

@@ -109,16 +109,15 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | Field | Description | Default |
 |-------|-------------|---------|
 | `servers.<id>.diagnosticTimeout` | Per-attempt timeout (ms) | per-language |
-| `servers.<id>.maxRetries` | Retry attempts on timeout (0-10) | `3` |
 | `servers.<id>.disabled` | Disable this server | `false` |
 | `servers.<id>.cdbAutoDiscover` | Find a compilation database clangd cannot see (C/C++) | `true` for `cpp` |
 | `servers.<id>.cdbGlobs` | Where to look, relative to the workspace root | `["build/**/compile_commands.json"]` |
 | `servers.<id>.cdbMaxDepth` | How deep to look, in path segments (1-8) | `3` |
 | `diagnosticTimeout` | Global default timeout (ms) | `5000` |
-| `documentIdleTimeout` | Close idle documents after (ms) | `120000` |
+| `maxOpenDocuments` | Documents one server holds open at once (5-200); the oldest are closed, their findings stay in the report | `15` |
 | `serverIdleTimeout` | Stop an unused server after (ms); `0` never stops one | `1800000` |
 
-Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
+Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
 
 ### C/C++: finding compile_commands.json
 
@@ -169,7 +168,7 @@ Notes:
 4. Skips the check if the file holds the exact text the server already has
 5. Pushes the disk text of any open document an outside tool rewrote
 6. Sends `didChange`, waits for `publishDiagnostics`
-7. If timeout: retries with exponential backoff + jitter (up to `maxRetries` times)
+7. If the window expires: report `timeout`. The text is sent once, never re-sent
 8. Filters to errors + warnings, formats, appends to tool result, shows in TUI, refreshes the footer total
 
 Cross-file impact is detected via snapshot-diff: if editing `lib.ts` breaks `caller.ts`, the report names
@@ -187,7 +186,7 @@ that was deleted is closed and its numbers are dropped, since they describe noth
 
 The other case is a write of the same text — an agent rewriting a file it just wrote. The server holds
 that text already and answers it with silence, because the answer did not change. Sending it anyway used
-to throw away the cached errors and end in a timeout after several retries: minutes of waiting and a
+to throw away the cached errors and end in a timeout after every wait window: minutes of waiting and a
 report saying the file is clean.
 
 The report has a fixed budget so a total breakage can't bury the diff: 20 lines for the edited file, 10
@@ -199,6 +198,13 @@ Servers are lazy (spawn on first edit), stop after 30 minutes without edits (`se
 `0` to keep them for the whole session), and clean up on session end. The timeout is long because a
 reading or review gap is normal, and a stopped server makes the next edit wait for a fresh start —
 which arrives in the report as a timeout.
+
+A server also holds a limited number of documents open (`maxOpenDocuments`, 15 by default): past that
+the least recently used are closed. The limit is a count, not a timer, because closing documents gives
+clangd back only part of the memory — 40 heavy C++ translation units took 1797 MB and closing all of
+them returned 574 MB of it — while the peak lands in a burst of edits, where no timer can reach.
+Stopping the server is what actually returns memory. A closed document keeps its last measurement, so
+the footer and `/lsp-diag` still name that file; it just says the numbers are the last ones taken.
 
 ## Development
 

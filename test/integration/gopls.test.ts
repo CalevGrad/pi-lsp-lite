@@ -14,7 +14,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
   let dir: string;
 
   before(async () => {
-    manager = createServerManager({ maxRetries: 0 });
+    manager = createServerManager({});
     dir = join(tmpdir(), `pi-lsp-gopls-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "go.mod"), "module example.com/test\n\ngo 1.21\n");

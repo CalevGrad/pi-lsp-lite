@@ -23,7 +23,6 @@ export interface FakeServerOptions {
   crashOnInit?: boolean;
   neverPublish?: boolean;
   neverShutdown?: boolean;
-  publishOnAttempt?: number;
   /** Model a server that stays silent when a didChange carries the text it already holds. */
   silentOnIdenticalText?: boolean;
 }
@@ -42,8 +41,6 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const neverShutdown = options.neverShutdown ?? false;
   const silentOnIdenticalText = options.silentOnIdenticalText ?? false;
   const lastText = new Map<string, string>();
-  const publishOnAttempt = options.publishOnAttempt ?? 1;
-  const attemptCounts = new Map<string, number>();
 
   const connection = createProtocolConnection(
     new StreamMessageReader(process.stdin),
@@ -67,11 +64,6 @@ export function startFakeServer(options: FakeServerOptions = {}) {
 
   function publishDiagnostics(uri: string) {
     if (neverPublish) return;
-
-    const count = (attemptCounts.get(uri) ?? 0) + 1;
-    attemptCounts.set(uri, count);
-
-    if (count < publishOnAttempt) return;
 
     const diags = options.diagnosticsByUri?.get(uri) ?? [defaultDiagnostic];
 
@@ -134,7 +126,6 @@ if (process.argv.includes("--run")) {
     if (raw.crashOnInit) options.crashOnInit = raw.crashOnInit;
     if (raw.neverPublish) options.neverPublish = raw.neverPublish;
     if (raw.neverShutdown) options.neverShutdown = raw.neverShutdown;
-    if (raw.publishOnAttempt !== undefined) options.publishOnAttempt = raw.publishOnAttempt;
     if (raw.silentOnIdenticalText) options.silentOnIdenticalText = raw.silentOnIdenticalText;
     if (raw.diagnosticsByUri) {
       options.diagnosticsByUri = new Map(Object.entries(raw.diagnosticsByUri));
